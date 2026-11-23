@@ -1,0 +1,600 @@
+const home = document.querySelector("#home");
+const homeActions = document.querySelector("#home-actions");
+const createForm = document.querySelector("#create-form");
+const joinForm = document.querySelector("#join-form");
+const joinCode = document.querySelector("#join-code");
+const settingsForm = document.querySelector("#settings-form");
+const settingsTemplate = document.querySelector("#settings-template");
+const statusMessage = document.querySelector("#connection-status");
+const retryButton = document.querySelector("#retry");
+const homeError = document.querySelector("#home-error");
+const lobby = document.querySelector("#lobby");
+const lobbyTitle = document.querySelector("#lobby-title");
+const lobbyConnection = document.querySelector("#lobby-connection");
+const lobbyError = document.querySelector("#lobby-error");
+const roomCode = document.querySelector("#room-code");
+const copyStatus = document.querySelector("#copy-status");
+const playerList = document.querySelector("#players");
+const roomStatus = document.querySelector("#room-status");
+const startButton = document.querySelector("#start-game");
+const readyButton = document.querySelector("#ready-next-round");
+const endMatchButton = document.querySelector("#end-match");
+const endMatchDialog = document.querySelector("#confirm-end-match");
+const returnHomeButton = document.querySelector("#return-home");
+const hostSettings = document.querySelector("#host-settings");
+const lobbySettings = document.querySelector("#lobby-settings");
+const roundPanel = document.querySelector("#round-panel");
+const roundForm = document.querySelector("#round-form");
+const roundInputs = document.querySelector("#round-inputs");
+const doneButton = document.querySelector("#done-round");
+const roundResults = document.querySelector("#round-results");
+const finalResults = document.querySelector("#final-results");
+const finalRoundTitle = document.querySelector("#final-round-title");
+const roundClock = document.querySelector("#round-clock");
+const roundTime = document.querySelector("#round-time");
+const answerStatusLabels = {
+  blank: "Blank",
+  invalid: "Invalid",
+  valid: "Valid",
+  duplicate: "Duplicate",
+};
+const categoryLabels = {};
+for (const field of settingsTemplate.content.querySelectorAll("input[name=category]")) {
+  categoryLabels[field.value] = field.parentElement.textContent.trim();
+}
+
+const sessionKey = "word-rally-room";
+let session = savedSession();
+let socket = null;
+let room = null;
+let joining = false;
+let connected = false;
+let pendingAction = null;
+let reconnectTimer = null;
+let retriedDuplicate = false;
+let confirmedSettings = null;
+let restoredDrafts = null;
+let countdownInterval = null;
+let countdownDeadline = 0;
+
+async function checkServer() {
+  retryButton.hidden = true;
+  statusMessage.dataset.state = "checking";
+  statusMessage.textContent = "Checking server…";
+
+  try {
+    const response = await fetch("/health", {
+      cache: "no-store",
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if (!response.ok || (await response.json()).status !== "ok") {
+      throw new Error("Health check failed");
+    }
+
+    statusMessage.dataset.state = "online";
+    statusMessage.textContent = "Server online";
+  } catch {
+    statusMessage.dataset.state = "unavailable";
+    statusMessage.textContent = "Server unavailable";
+    retryButton.hidden = false;
+  }
+}
+
+function savedSession() {
+  try {
+    return JSON.parse(sessionStorage.getItem(sessionKey));
+  } catch {
+    return null;
+  }
+}
+
+function storeSession(value) {
+  session = value;
+  try {
+    if (value) {
+      sessionStorage.setItem(sessionKey, JSON.stringify(value));
+    } else {
+      sessionStorage.removeItem(sessionKey);
+    }
+  } catch {
+    // The current tab can still play when browser storage is unavailable.
+  }
+}
+
+function setError(element, message = "") {
+  element.textContent = message;
+  element.hidden = !message;
+}
+
+function showEntry(form) {
+  homeActions.hidden = Boolean(form);
+  createForm.hidden = form !== createForm;
+  joinForm.hidden = form !== joinForm;
+  setError(homeError);
+}
+
+function updateRoundCount(form) {
+  const endless = form.elements.mode.value === "endless";
+  form.querySelector(".round-count").hidden = endless;
+  form.elements.rounds.disabled = endless;
+}
+
+function readSettings(form, errorElement) {
+  const data = new FormData(form);
+  const categories = data.getAll("category");
+  if (!categories.length) {
+    setError(errorElement, "Select at least one category.");
+    form.querySelector("input[name=category]").focus();
+    return null;
+  }
+  return {
+    categories,
+    duration: Number(data.get("duration")),
+    mode: data.get("mode"),
+    rounds: data.has("rounds") ? Number(data.get("rounds")) : null,
+  };
+}
+
+function showSettings(settings) {
+  document.querySelector("#current-categories").textContent = settings.categories.map((key) => categoryLabels[key]).join(", ");
+  document.querySelector("#current-duration").textContent = `${settings.duration} seconds`;
+  document.querySelector("#current-mode").textContent = settings.mode === "fixed" ? `${settings.rounds} fixed rounds` : "Endless";
+
+  // Connection updates should leave an unfinished host edit in place.
+  const currentSettings = JSON.stringify(settings);
+  if (confirmedSettings === currentSettings) return;
+  confirmedSettings = currentSettings;
+  for (const field of settingsForm.querySelectorAll("input[name=category]")) {
+    field.checked = settings.categories.includes(field.value);
+  }
+  settingsForm.elements.duration.value = settings.duration;
+  settingsForm.elements.mode.value = settings.mode;
+  settingsForm.elements.rounds.value = settings.rounds ?? 5;
+  updateRoundCount(settingsForm);
+}
+
+function showPlayers() {
+  const slots = room.players.length < 2 ? [...room.players, { label: "Player 2" }] : room.players;
+  const rows = slots.map((player) => {
+    const row = document.createElement("li");
+    const label = document.createElement("strong");
+    const flags = document.createElement("div");
+    const status = document.createElement("span");
+    const role = player.host ? " · Host" : "";
+    const self = player.id && player.id === session?.player_id;
+    const playerConnected = player.connected && (!self || connected);
+    label.textContent = `${player.label}${role}${self ? " (you)" : ""}`;
+    flags.className = "player-flags";
+    status.className = "player-status";
+    status.dataset.connected = Boolean(playerConnected);
+    status.textContent = playerConnected ? "Connected" : player.id ? "Disconnected" : "Waiting to join";
+    flags.append(status);
+    if (room.phase === "results") {
+      const ready = document.createElement("span");
+      ready.className = "player-ready";
+      ready.dataset.ready = room.ready[player.id];
+      ready.textContent = room.ready[player.id] ? "Ready" : "Not ready";
+      flags.append(ready);
+    }
+    row.append(label, flags);
+    return row;
+  });
+  playerList.replaceChildren(...rows);
+}
+
+function updateCountdown() {
+  const seconds = Math.max(0, Math.ceil((countdownDeadline - performance.now()) / 1000));
+  const remainder = String(seconds % 60).padStart(2, "0");
+  const display = `${Math.floor(seconds / 60)}:${remainder}`;
+  if (roundTime.textContent !== display) roundTime.textContent = display;
+}
+
+function stopCountdown() {
+  clearInterval(countdownInterval);
+  countdownInterval = null;
+}
+
+function buildAnswerFields(categories) {
+  const fields = categories.map((category) => {
+    const label = document.createElement("label");
+    const input = document.createElement("input");
+    label.textContent = categoryLabels[category];
+    input.name = category;
+    input.maxLength = 80;
+    input.autocomplete = "off";
+    label.append(input);
+    return label;
+  });
+  roundInputs.replaceChildren(...fields);
+}
+
+function showResults(round) {
+  const headers = ["Category", ...room.players.map((player) => player.label)];
+  document.querySelector("#results-players").replaceChildren(...headers.map((header) => {
+    const cell = document.createElement("th");
+    cell.scope = "col";
+    cell.textContent = header;
+    return cell;
+  }));
+
+  const rows = round.categories.map((category) => {
+    const row = document.createElement("tr");
+    const label = document.createElement("th");
+    label.scope = "row";
+    label.textContent = categoryLabels[category];
+    row.append(label);
+    for (const player of room.players) {
+      const answer = round.submitted_answers[player.id][category];
+      const result = round.answer_results[player.id][category];
+      const cell = document.createElement("td");
+      if (answer) {
+        const text = document.createElement("span");
+        text.className = "answer-text";
+        text.textContent = answer;
+        cell.append(text);
+      }
+
+      const details = document.createElement("div");
+      details.className = "answer-details";
+      const status = document.createElement("span");
+      status.className = "answer-status";
+      status.dataset.status = result.status;
+      status.textContent = answerStatusLabels[result.status];
+      const points = document.createElement("span");
+      points.className = "answer-points";
+      points.textContent = `${result.points} pts`;
+      details.append(status, points);
+      cell.append(details);
+      row.append(cell);
+    }
+    return row;
+  });
+  document.querySelector("#results-answers").replaceChildren(...rows);
+
+  const totals = [
+    ["Round total", round.round_scores],
+    ["Match total", room.match_scores],
+  ];
+  const totalRows = totals.map(([name, scores]) => {
+    const row = document.createElement("tr");
+    const label = document.createElement("th");
+    label.scope = "row";
+    label.textContent = name;
+    row.append(label);
+    for (const player of room.players) {
+      const cell = document.createElement("td");
+      cell.textContent = `${scores[player.id]} pts`;
+      row.append(cell);
+    }
+    return row;
+  });
+  document.querySelector("#results-totals").replaceChildren(...totalRows);
+  document.querySelector("#round-ended-message").textContent =
+    round.ended_by === "timeout" ? "Time ran out." : "A player clicked Done.";
+}
+
+function showFinalResults() {
+  const { winner_id: winnerId, rounds_played: roundsPlayed } = room.final_result;
+  const winner = room.players.find((player) => player.id === winnerId);
+  document.querySelector("#match-outcome").textContent = winner ? `${winner.label} wins!` : "Draw";
+  document.querySelector("#match-rounds").textContent = `${roundsPlayed} ${roundsPlayed === 1 ? "round" : "rounds"} played`;
+  finalRoundTitle.textContent = `Round ${room.round.number} results`;
+
+  const standings = room.players.flatMap((player) => {
+    const name = document.createElement("dt");
+    name.textContent = player.label;
+    const score = document.createElement("dd");
+    score.textContent = `${room.match_scores[player.id]} pts`;
+    return [name, score];
+  });
+  document.querySelector("#match-scores").replaceChildren(...standings);
+}
+
+function showRound(previousRoom) {
+  const round = room.round;
+  const active = room.phase === "active";
+  const finished = room.phase === "finished";
+  const scored = room.phase === "results" || finished;
+  roundPanel.hidden = !round;
+  roundForm.hidden = !active;
+  roundClock.hidden = !active;
+  roundResults.hidden = !scored;
+  finalResults.hidden = !finished;
+  finalRoundTitle.hidden = !finished;
+
+  if (!active) stopCountdown();
+  if (!round) return;
+
+  const newRound = previousRoom?.code !== room.code || previousRoom?.round?.number !== round.number;
+  document.querySelector("#round-letter").textContent = round.letter;
+  if (active) {
+    if (newRound) buildAnswerFields(round.categories);
+    if (restoredDrafts?.round_number === round.number) {
+      for (const field of roundInputs.elements) {
+        field.value = restoredDrafts.answers[field.name] ?? "";
+      }
+    }
+    countdownDeadline = performance.now() + round.remaining_ms;
+    updateCountdown();
+    if (countdownInterval === null) countdownInterval = setInterval(updateCountdown, 100);
+  } else if (scored && (newRound || previousRoom?.phase !== room.phase)) {
+    showResults(round);
+    if (finished) showFinalResults();
+  }
+  restoredDrafts = null;
+}
+
+function updateControls() {
+  for (const control of home.querySelectorAll(".primary, #show-join, [data-home]")) {
+    control.disabled = joining;
+  }
+  if (!room) return;
+
+  const isHost = room.players.some((player) => player.id === session?.player_id && player.host);
+  const bothConnected = room.players.length === 2 && room.players.every((player) => player.connected);
+  const inLobby = room.phase === "lobby";
+  const inResults = room.phase === "results";
+  const finished = room.phase === "finished";
+  const ownReady = inResults && room.ready[session?.player_id];
+  const canEndMatch = inResults && room.settings.mode === "endless";
+  const canAnswer = room.phase === "active" && connected && !pendingAction;
+  lobbyConnection.dataset.state = connected ? "online" : "unavailable";
+  lobbyConnection.textContent = connected ? (inLobby ? "Lobby connected" : "Room connected") : session ? "Reconnecting…" : "Connection lost";
+  startButton.hidden = !isHost || !inLobby;
+  startButton.disabled = !connected || !bothConnected || Boolean(pendingAction);
+  readyButton.hidden = !inResults;
+  readyButton.disabled = !inResults || !connected || ownReady || Boolean(pendingAction);
+  endMatchButton.hidden = !canEndMatch;
+  endMatchButton.disabled = !canEndMatch || !connected || Boolean(pendingAction);
+  if (endMatchDialog.open && (!canEndMatch || !connected)) endMatchDialog.close();
+  lobbySettings.hidden = !inLobby;
+  hostSettings.hidden = !isHost || !inLobby;
+  settingsForm.querySelector("button[type=submit]").disabled = !connected || Boolean(pendingAction);
+  returnHomeButton.hidden = connected || finished;
+  roundInputs.disabled = !canAnswer;
+  doneButton.disabled = !canAnswer;
+
+  if (inLobby) {
+    lobbyTitle.textContent = "Room lobby";
+    if (!bothConnected) {
+      roomStatus.textContent = room.players.length < 2 ? "Share the room code with a friend." : "Waiting for the other player to reconnect.";
+    } else {
+      roomStatus.textContent = isHost ? "Both players are ready to start." : "Waiting for the host to start.";
+    }
+  } else if (finished) {
+    lobbyTitle.textContent = "Match complete";
+    roomStatus.textContent = "";
+  } else {
+    const title = `Round ${room.round.number}`;
+    lobbyTitle.textContent = inResults ? `${title} ended` : title;
+    const otherPlayer = room.players.find((player) => player.id !== session?.player_id);
+    if (!otherPlayer?.connected) {
+      roomStatus.textContent = "The other player is disconnected.";
+    } else {
+      roomStatus.textContent = ownReady ? "Waiting for the other player to be ready." : "";
+    }
+  }
+}
+
+function keepPendingAction() {
+  if (pendingAction === "done") return room.phase === "active";
+  if (pendingAction === "end_match") return room.phase === "results";
+  if (pendingAction === "ready") return room.phase === "results" && !room.ready[session?.player_id];
+  return false;
+}
+
+function showRoom(state) {
+  const opening = lobby.hidden;
+  const previousRoom = room;
+  room = state;
+  connected = true;
+  joining = false;
+  if (!keepPendingAction()) pendingAction = null;
+  roomCode.value = room.code;
+  showPlayers();
+  showSettings(room.settings);
+  showRound(previousRoom);
+  updateControls();
+  home.hidden = true;
+  lobby.hidden = false;
+  if (opening || previousRoom?.phase !== room.phase) lobbyTitle.focus();
+}
+
+function stopSocket() {
+  const previous = socket;
+  socket = null;
+  if (previous) previous.close();
+}
+
+function resumeSession() {
+  if (session) connect({ type: "resume", code: session.code, token: session.token });
+}
+
+function reconnect() {
+  clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(resumeSession, 1200);
+}
+
+function connect(request) {
+  clearTimeout(reconnectTimer);
+  stopSocket();
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const connection = new WebSocket(`${protocol}//${window.location.host}/ws`);
+  socket = connection;
+  joining = true;
+  connected = false;
+  pendingAction = null;
+  restoredDrafts = null;
+  setError(homeError);
+  setError(lobbyError);
+  updateControls();
+
+  const handshakeTimeout = setTimeout(() => connection.close(), 8000);
+  connection.addEventListener("open", () => {
+    if (socket === connection) connection.send(JSON.stringify(request));
+  });
+  connection.addEventListener("message", (event) => {
+    if (socket !== connection) return;
+    const message = JSON.parse(event.data);
+    if (message.type === "session") {
+      storeSession({ code: message.code, player_id: message.player_id, token: message.token });
+    } else if (message.type === "drafts") {
+      restoredDrafts = message;
+    } else if (message.type === "state") {
+      clearTimeout(handshakeTimeout);
+      retriedDuplicate = false;
+      if (pendingAction) setError(lobbyError);
+      showRoom(message.room);
+    } else if (message.type === "error") {
+      if (joining) {
+        clearTimeout(handshakeTimeout);
+        stopSocket();
+        joining = false;
+        if (request.type === "resume" && message.code === "duplicate_connection" && !retriedDuplicate) {
+          retriedDuplicate = true;
+          reconnect();
+          updateControls();
+          return;
+        }
+        storeSession(null);
+        updateControls();
+      }
+      pendingAction = null;
+      setError(lobby.hidden ? homeError : lobbyError, message.message);
+      updateControls();
+    }
+  });
+  connection.addEventListener("close", () => {
+    clearTimeout(handshakeTimeout);
+    if (socket !== connection) return;
+    socket = null;
+    connected = false;
+    joining = false;
+    pendingAction = null;
+    if (room) showPlayers();
+    updateControls();
+    if (session) {
+      reconnect();
+    } else {
+      setError(homeError, "Could not connect to the lobby server. Try again.");
+    }
+  });
+}
+
+function sendAction(message) {
+  if (!connected || pendingAction || socket?.readyState !== WebSocket.OPEN) return;
+  pendingAction = message.type;
+  setError(lobbyError);
+  updateControls();
+  socket.send(JSON.stringify(message));
+}
+
+for (const form of [createForm, settingsForm]) {
+  form.querySelector(".settings-fields").append(settingsTemplate.content.cloneNode(true));
+  form.elements.mode.addEventListener("change", () => updateRoundCount(form));
+}
+
+document.querySelector("#show-create").addEventListener("click", () => {
+  showEntry(createForm);
+  document.querySelector("#create-title").focus();
+});
+document.querySelector("#show-join").addEventListener("click", () => {
+  showEntry(joinForm);
+  joinCode.focus();
+});
+for (const button of document.querySelectorAll("[data-home]")) {
+  button.addEventListener("click", () => {
+    const action = button.form === createForm ? "#show-create" : "#show-join";
+    showEntry(null);
+    document.querySelector(action).focus();
+  });
+}
+
+createForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (joining) return;
+  const settings = readSettings(createForm, homeError);
+  if (settings) connect({ type: "create", settings });
+});
+joinForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (!joining) connect({ type: "join", code: joinCode.value.trim().toUpperCase() });
+});
+settingsForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const settings = readSettings(settingsForm, lobbyError);
+  if (settings) sendAction({ type: "update_settings", settings });
+});
+startButton.addEventListener("click", () => sendAction({ type: "start" }));
+roundForm.addEventListener("input", (event) => {
+  if (room?.phase !== "active" || !connected || pendingAction || socket?.readyState !== WebSocket.OPEN) return;
+  socket.send(JSON.stringify({
+    type: "draft",
+    round_number: room.round.number,
+    category: event.target.name,
+    answer: event.target.value,
+  }));
+});
+roundForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (room?.phase === "active") sendAction({ type: "done", round_number: room.round.number });
+});
+readyButton.addEventListener("click", () => {
+  if (room?.phase === "results") sendAction({ type: "ready", round_number: room.round.number });
+});
+endMatchButton.addEventListener("click", () => {
+  if (!endMatchButton.disabled && !endMatchDialog.open) endMatchDialog.showModal();
+});
+endMatchDialog.addEventListener("submit", (event) => {
+  if (event.submitter?.value === "confirm" && room?.phase === "results") {
+    sendAction({ type: "end_match", round_number: room.round.number });
+  }
+});
+
+document.querySelector("#copy-code").addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText(roomCode.value);
+    copyStatus.textContent = "Room code copied.";
+  } catch {
+    roomCode.focus();
+    roomCode.select();
+    copyStatus.textContent = "Room code selected. Copy it to share.";
+  }
+});
+
+function leaveRoom(entry = null) {
+  clearTimeout(reconnectTimer);
+  stopSocket();
+  storeSession(null);
+  room = null;
+  joining = false;
+  connected = false;
+  pendingAction = null;
+  retriedDuplicate = false;
+  restoredDrafts = null;
+  confirmedSettings = null;
+  copyStatus.textContent = "";
+  stopCountdown();
+  lobby.hidden = true;
+  home.hidden = false;
+  showEntry(entry);
+  updateControls();
+  document.querySelector(entry === createForm ? "#create-title" : "#show-create").focus();
+}
+
+returnHomeButton.addEventListener("click", () => leaveRoom());
+document.querySelector("#create-new-room").addEventListener("click", () => leaveRoom(createForm));
+
+window.addEventListener("pagehide", () => {
+  clearTimeout(reconnectTimer);
+  stopCountdown();
+  stopSocket();
+});
+window.addEventListener("pageshow", (event) => {
+  if (event.persisted) resumeSession();
+});
+
+retryButton.addEventListener("click", checkServer);
+checkServer();
+resumeSession();

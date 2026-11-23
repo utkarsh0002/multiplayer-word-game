@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="A two-player category word game.">
+    <title>Word Rally</title>
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="/static/styles.css">
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <main>
+    <div class="home" id="home">
+      <section class="intro" aria-labelledby="title">
+        <h1 id="title">Word <span>Rally</span></h1>
+        <p class="description">Race a friend to find a word for each category, all starting with the same letter.</p>
+        <div class="actions" id="home-actions">
+          <button class="primary" id="show-create" type="button">Create Room</button>
+          <button id="show-join" type="button">Join Room</button>
+        </div>
+
+        <form class="panel entry-form" id="create-form" aria-labelledby="create-title" hidden>
+          <h2 id="create-title" tabindex="-1">Create a room</h2>
+          <div class="settings-fields"></div>
+          <div class="actions">
+            <button class="primary" type="submit">Create Room</button>
+            <button class="quiet" type="button" data-home>Back</button>
+          </div>
+        </form>
+
+        <form class="panel entry-form" id="join-form" aria-labelledby="join-title" hidden>
+          <h2 id="join-title">Join a room</h2>
+          <label for="join-code">Room code</label>
+          <input id="join-code" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" required>
+          <div class="actions">
+            <button class="primary" type="submit">Join Room</button>
+            <button class="quiet" type="button" data-home>Back</button>
+          </div>
+        </form>
+
+        <p id="home-error" class="error" role="alert" hidden></p>
+        <div class="connection" id="home-connection">
+          <p id="connection-status" class="connection-status" role="status" data-state="checking">
+            Checking server&hellip;
+          </p>
+          <button id="retry" type="button" hidden>Retry</button>
+        </div>
+        <noscript>Enable JavaScript to create or join a room.</noscript>
+      </section>
+
+      <div class="board" aria-hidden="true">
+        <div class="tiles">
+          <span class="tile tile-w">W</span>
+          <span class="tile tile-o">O</span>
+          <span class="tile tile-r">R</span>
+          <span class="tile tile-a">A</span>
+          <span class="tile tile-l-first">L</span>
+          <span class="tile tile-l-second">L</span>
+          <span class="tile tile-y">Y</span>
+          <span class="tile tile-d">D</span>
+        </div>
+      </div>
+    </div>
+
+    <section class="lobby" id="lobby" aria-labelledby="lobby-title" hidden>
+      <header class="lobby-header">
+        <h1 id="lobby-title" tabindex="-1">Room lobby</h1>
+        <p class="connection-status" id="lobby-connection" role="status" data-state="checking">Connecting…</p>
+      </header>
+
+      <div class="lobby-grid">
+        <section class="panel lobby-panel" id="final-results" aria-label="Final results" hidden>
+          <h2 id="match-outcome" class="match-outcome"></h2>
+          <p id="match-rounds" class="match-rounds"></p>
+          <dl id="match-scores" class="match-scores"></dl>
+          <button class="primary" id="create-new-room" type="button">Create New Room</button>
+        </section>
+        <div class="panel lobby-panel round-panel" id="round-panel" hidden>
+          <h2 id="final-round-title" class="final-round-title" hidden></h2>
+          <div class="round-summary">
+            <div class="round-stat">
+              <span>Starting letter</span>
+              <strong id="round-letter" class="round-letter"></strong>
+            </div>
+            <div class="round-stat" id="round-clock">
+              <span id="round-time-label">Time remaining</span>
+              <span id="round-time" role="timer" aria-labelledby="round-time-label"></span>
+            </div>
+          </div>
+          <form id="round-form" hidden>
+            <fieldset id="round-inputs" class="round-inputs"></fieldset>
+            <button class="primary" id="done-round" type="submit">Done</button>
+          </form>
+          <section id="round-results" aria-labelledby="results-title" hidden>
+            <p id="round-ended-message"></p>
+            <h2 id="results-title">Submitted answers</h2>
+            <table class="answers-table">
+              <thead><tr id="results-players"></tr></thead>
+              <tbody id="results-answers"></tbody>
+              <tfoot id="results-totals"></tfoot>
+            </table>
+            <p class="results-note">Word Rally checks a built-in list for each category. Words missing from the list are marked Invalid.</p>
+          </section>
+        </div>
+
+        <div class="panel lobby-panel">
+          <div class="code-row">
+            <div>
+              <label for="room-code">Room code</label>
+              <input id="room-code" class="room-code" type="text" readonly size="6">
+            </div>
+            <button id="copy-code" type="button">Copy code</button>
+          </div>
+          <p id="copy-status" class="copy-status" role="status"></p>
+
+          <h2>Players</h2>
+          <ul id="players" class="player-list"></ul>
+          <p id="room-status" class="room-status" role="status"></p>
+          <div class="actions">
+            <button id="start-game" class="primary" type="button" hidden>Start</button>
+            <button id="ready-next-round" class="primary" type="button" hidden>Ready</button>
+            <button id="end-match" type="button" hidden>End Match</button>
+            <button id="return-home" type="button" hidden>Return home</button>
+          </div>
+          <p id="lobby-error" class="error" role="alert" hidden></p>
+        </div>
+
+        <div class="panel lobby-panel" id="lobby-settings">
+          <h2>Room settings</h2>
+          <dl class="settings-summary">
+            <dt>Categories</dt><dd id="current-categories"></dd>
+            <dt>Round timer</dt><dd id="current-duration"></dd>
+            <dt>Game mode</dt><dd id="current-mode"></dd>
+          </dl>
+          <details id="host-settings" hidden>
+            <summary>Edit settings</summary>
+            <form id="settings-form" class="entry-form">
+              <div class="settings-fields"></div>
+              <button type="submit">Save settings</button>
+            </form>
+          </details>
+        </div>
+      </div>
+    </section>
+
+    <dialog id="confirm-end-match" class="panel match-dialog" aria-labelledby="end-match-title" aria-describedby="end-match-description">
+      <form method="dialog">
+        <h2 id="end-match-title">End this match?</h2>
+        <p id="end-match-description">Both players will see the final scores.</p>
+        <div class="actions">
+          <button type="submit" value="cancel" autofocus>Cancel</button>
+          <button class="primary" type="submit" value="confirm">End Match</button>
+        </div>
+      </form>
+    </dialog>
+    </main>
+
+    <template id="settings-template">
+      <fieldset>
+        <legend>Categories</legend>
+        <div class="category-options">
+          <label><input type="checkbox" name="category" value="animals" checked> Animals</label>
+          <label><input type="checkbox" name="category" value="countries" checked> Countries</label>
+          <label><input type="checkbox" name="category" value="food" checked> Food</label>
+          <label><input type="checkbox" name="category" value="sports" checked> Sports</label>
+          <label><input type="checkbox" name="category" value="cities" checked> Cities</label>
+        </div>
+      </fieldset>
+      <div class="setting-inputs">
+        <label>Seconds per round <input name="duration" type="number" min="15" max="180" value="60" required></label>
+        <label>Game mode
+          <select name="mode">
+            <option value="fixed">Fixed rounds</option>
+            <option value="endless">Endless</option>
+          </select>
+        </label>
+        <label class="round-count">Round count <input name="rounds" type="number" min="1" max="20" value="5" required></label>
+      </div>
+    </template>
+  </body>
+</html>
