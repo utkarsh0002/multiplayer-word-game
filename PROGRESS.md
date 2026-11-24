@@ -1,6 +1,6 @@
 # Word Rally progress
 
-**Milestone 5 is complete.** Two players can play a scored match with multiple rounds in either Fixed or Endless mode.
+**Milestone 6A.1 is complete.** Hosts can opt into Community Word Approval while the default strict word-list game remains available.
 
 For the complete game rules, see [GAME_DESIGN.md](GAME_DESIGN.md). For the current implementation and message protocol, see [ARCHITECTURE.md](ARCHITECTURE.md). Local setup and a two-window walkthrough are in [README.md](README.md).
 
@@ -13,19 +13,22 @@ For the complete game rules, see [GAME_DESIGN.md](GAME_DESIGN.md). For the curre
 | 3 · First playable round | The host starts round 1 with a shared random A–Z letter and configured categories. Each player gets a countdown, one field per category, and Done. The server accepts private drafts and restores them to their owner on active-round resume. Either Done or the server deadline freezes both players' latest drafts once. Both players see the same submitted answers. |
 | 4 · Validation and scoring | The server checks frozen answers against the assigned letter and local category lists, classifies answers, awards 10 points for valid unique answers, 5 each for valid duplicates, and 0 for blank or invalid answers. Both browsers see each answer's status and points plus both players' round and cumulative match totals. |
 | 5 · Multiple rounds and match end | Both connected players choose Ready to advance after a round. The server starts each new round once, resets round data, and carries match totals forward. Fixed matches finish automatically at the configured round count, and either player can end an Endless match from between-round results. Both browsers show final scores and the winner or draw. Reconnects retain the current match state and the player's seat. |
+| 6A · Backend hardening and reliability | Strict WebSocket JSON and admission limits, digested room credentials, socket-specific cleanup, bounded room capacity, identity-checked timers, and sanitized error handling. Regression tests exercise malformed input, privacy, disconnects, expiry, fault recovery, and competing actions. |
+| 6A.1 · Community Word Approval | Unlisted answers that pass eligibility checks enter an optional 15-second review. Players can decide only opponent entries. Pending decisions survive reconnects and time out on the server, and final decisions determine round scoring. The review and results screens display decisions. |
 
-The suite covers lobby behavior, capacity, permissions, reconnects, cleanup, shared round metadata, draft isolation, early Done, autonomous timeout, validation, and scoring. Match coverage includes Ready synchronization, fresh rounds, cumulative scores, and completion in both modes. Run the full suite from the project root using the command in [README.md](README.md).
+The suite covers lobby behavior, capacity, permissions, reconnects, cleanup, shared round metadata, draft isolation, early Done, autonomous timeout, validation, scoring, and match progression. Community Word Approval has regression coverage for eligibility, first-decision and opponent-only enforcement, timeouts, reconnects, concurrent decisions, and scoring. Run the full suite from the project root using the command in [README.md](README.md).
 
 ## Pending milestones
 
 | Milestone | Remaining work |
 | --- | --- |
-| 6 · Hardening | Expand regression coverage for the completed match flow, improve disconnect and input handling where needed, verify mobile and desktop layouts and error states, and refresh setup and limitation documentation. |
+| 6B · Frontend hardening | Review browser reconnect and error states, verify mobile and desktop behavior, and improve frontend reliability. |
 
 ## Known limitations
 
-- The built-in lists are starter data. A correctly spelled word can still be marked Invalid if its exact normalized spelling is absent from the category list. Some categories have gaps for rare starting letters.
+- The built-in lists are starter data. In strict rooms, a correctly spelled unlisted word is invalid. In approval-enabled rooms, an eligible unlisted answer depends on the opposing player's decision before the deadline. Approval applies to that submission only and does not expand a word list.
 - The room retains the current or most recently scored round. Earlier rounds contribute to cumulative scores and have no separate history view.
 - The app uses a single backend process and stores rooms and sessions in memory. Restarting or reloading the backend clears them.
 - A disconnect leaves the seat reserved for its token and the round timer keeps running. At between-round results, play waits for both seats to be ready and connected. A room becomes eligible for cleanup after ten minutes with every player disconnected. Browser recovery after a reload depends on the joining tab retaining its session token.
-- The project provides local run instructions. Internet hosting is outside the current project setup.
+- The browser retries a duplicate-session response once before clearing its saved session. A stale socket that takes longer to close can interfere with automatic recovery.
+- The local MVP caps rooms and per-socket admission work. It has no per-IP rate limits or public hosting configuration.

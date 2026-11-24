@@ -237,6 +237,12 @@ input[type="checkbox"] {
   width: 100%;
 }
 
+.community-option {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
 .lobby {
   width: min(100%, 60rem);
   margin-inline: auto;
@@ -470,6 +476,57 @@ input.room-code {
 
 .round-inputs input {
   width: 100%;
+}
+
+.review-help, .review-progress {
+  color: #4e425d;
+  line-height: 1.45;
+}
+
+.review-help {
+  margin: 0 0 0.65rem;
+}
+
+.review-progress {
+  margin: 0 0 1rem;
+  font-weight: 600;
+}
+
+.review-list {
+  display: grid;
+  gap: 0.6rem;
+  margin: 0.65rem 0 1rem;
+  padding: 0;
+  list-style: none;
+}
+
+.review-entry {
+  display: grid;
+  gap: 0.4rem;
+  min-width: 0;
+  padding: 0.75rem;
+  border: 1px solid #dfd5ee;
+  border-radius: 0.6rem;
+  overflow-wrap: anywhere;
+}
+
+.review-category, .review-status {
+  color: #514760;
+  font-size: 0.88rem;
+  font-weight: 600;
+}
+
+.review-status[data-status="accepted"] {
+  color: #1a6140;
+}
+
+.review-status[data-status="rejected"], .review-status[data-status="timed_out"] {
+  color: #9e163f;
+}
+
+.review-decision {
+  display: block;
+  margin-top: 0.3rem;
 }
 
 .answers-table {

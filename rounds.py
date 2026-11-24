@@ -4,6 +4,7 @@ from math import ceil
 from string import ascii_uppercase
 from time import monotonic, time
 
+from review import Review, pending_entries
 from scoring import AnswerResult, score_answers
 
 
@@ -27,6 +28,7 @@ class Round:
     submitted_answers: dict[str, dict[str, str]] | None = None
     answer_results: dict[str, dict[str, AnswerResult]] | None = None
     round_scores: dict[str, int] | None = None
+    review: Review | None = None
 
     @classmethod
     def begin(cls, categories: tuple[str, ...], duration_seconds: float, player_ids: list[str]) -> "Round":
@@ -59,12 +61,26 @@ class Round:
         self.drafts[player_id][category] = answer
         return True
 
-    def submit(self, reason: str) -> dict[str, int]:
-        submitted_answers = {
+    def _freeze_answers(self) -> dict[str, dict[str, str]]:
+        return {
             player_id: {category: answer.strip() for category, answer in answers.items()}
             for player_id, answers in self.drafts.items()
         }
-        answer_results, round_scores = score_answers(self.letter, self.categories, submitted_answers)
+
+    def begin_review(self, reason: str) -> bool:
+        submitted_answers = self._freeze_answers()
+        entries = pending_entries(self.letter, self.categories, submitted_answers)
+        if not entries:
+            return False
+        self.review = Review.begin(entries)
+        self.submitted_answers = submitted_answers
+        self.ended_by = reason
+        return True
+
+    def submit(self, reason: str) -> dict[str, int]:
+        submitted_answers = self._freeze_answers() if self.submitted_answers is None else self.submitted_answers
+        approved = self.review.approved_answers() if self.review is not None else frozenset()
+        answer_results, round_scores = score_answers(self.letter, self.categories, submitted_answers, approved=approved)
         self.submitted_answers = submitted_answers
         self.answer_results = answer_results
         self.round_scores = round_scores
@@ -72,7 +88,7 @@ class Round:
         return round_scores
 
     def snapshot(self) -> dict:
-        return {
+        state = {
             "number": self.number,
             "letter": self.letter,
             "categories": self.categories,
@@ -80,7 +96,10 @@ class Round:
             "deadline": self.deadline,
             "remaining_ms": 0 if self.ended_by else ceil(self.seconds_remaining() * 1000),
             "ended_by": self.ended_by,
-            "submitted_answers": self.submitted_answers,
+            "submitted_answers": self.submitted_answers if self.round_scores is not None else None,
             "answer_results": self.answer_results,
             "round_scores": self.round_scores,
         }
+        if self.review is not None:
+            state["review"] = self.review.snapshot(scored=self.round_scores is not None)
+        return state

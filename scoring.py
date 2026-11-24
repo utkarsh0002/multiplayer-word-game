@@ -1,3 +1,4 @@
+from collections.abc import Set
 from typing import Literal, TypedDict
 
 from word_lists import WORD_LISTS
@@ -12,19 +13,12 @@ class AnswerResult(TypedDict):
     points: int
 
 
-def classify_answer(answer: str, opponent: str, letter: str, words: frozenset[str]) -> AnswerStatus:
-    if not answer:
-        return "blank"
-    if not answer.startswith(letter) or answer not in words:
-        return "invalid"
-    # An identical normalized answer passes the same letter and category checks.
-    if answer == opponent:
-        return "duplicate"
-    return "valid"
-
-
 def score_answers(
-    letter: str, categories: tuple[str, ...], submitted_answers: dict[str, dict[str, str]]
+    letter: str,
+    categories: tuple[str, ...],
+    submitted_answers: dict[str, dict[str, str]],
+    *,
+    approved: Set[tuple[str, str]] = frozenset(),
 ) -> tuple[dict[str, dict[str, AnswerResult]], dict[str, int]]:
     """Score the two players' frozen answers independently by category."""
     first, second = submitted_answers
@@ -38,8 +32,20 @@ def score_answers(
             player_id: submitted_answers[player_id][category].strip().casefold()
             for player_id in (first, second)
         }
+        valid = {
+            player_id for player_id, answer in answers.items()
+            if answer.startswith(starting_letter) and (answer in words or (player_id, category) in approved)
+        }
         for player_id, opponent_id in ((first, second), (second, first)):
-            status = classify_answer(answers[player_id], answers[opponent_id], starting_letter, words)
+            answer = answers[player_id]
+            if not answer:
+                status: AnswerStatus = "blank"
+            elif player_id not in valid:
+                status = "invalid"
+            elif opponent_id in valid and answer == answers[opponent_id]:
+                status = "duplicate"
+            else:
+                status = "valid"
             points = POINTS[status]
             results[player_id][category] = {"status": status, "points": points}
             totals[player_id] += points

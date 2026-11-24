@@ -1,6 +1,7 @@
 import re
 import secrets
 from dataclasses import asdict, dataclass, field
+from hashlib import sha256
 from time import monotonic
 from uuid import uuid4
 
@@ -11,6 +12,12 @@ from word_lists import WORD_LISTS
 CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 CATEGORIES = tuple(WORD_LISTS)
 EMPTY_ROOM_GRACE = 600
+MAX_ROOMS = 1024
+TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{32}")
+
+
+def token_hash(token: str) -> bytes:
+    return sha256(token.encode("ascii")).digest()
 
 
 class RoomError(Exception):
@@ -25,10 +32,12 @@ class Settings:
     duration: int = 60
     mode: str = "fixed"
     rounds: int | None = 5
+    community_word_approval: bool = False
 
     @classmethod
     def parse(cls, data: object) -> "Settings":
-        if not isinstance(data, dict) or data.keys() != {"categories", "duration", "mode", "rounds"}:
+        required = {"categories", "duration", "mode", "rounds"}
+        if not isinstance(data, dict) or data.keys() not in (required, required | {"community_word_approval"}):
             raise RoomError("invalid_settings", "Send categories, a round timer, a mode, and a round count.")
 
         categories = data["categories"]
@@ -51,14 +60,24 @@ class Settings:
         elif mode != "endless" or rounds is not None:
             raise RoomError("invalid_settings", "Choose Fixed rounds or Endless mode.")
 
-        return cls(tuple(categories), duration, mode, rounds)
+        approval = data.get("community_word_approval", False)
+        if type(approval) is not bool:
+            raise RoomError("invalid_settings", "Community word approval must be true or false.")
+        return cls(tuple(categories), duration, mode, rounds, approval)
+
+    def snapshot(self) -> dict:
+        settings = asdict(self)
+        if not self.community_word_approval:
+            # Keep the settings shape unchanged for rooms using strict validation.
+            del settings["community_word_approval"]
+        return settings
 
 
 @dataclass
 class Player:
     label: str
+    token_hash: bytes = field(repr=False)
     id: str = field(default_factory=lambda: uuid4().hex)
-    token: str = field(default_factory=lambda: secrets.token_urlsafe(24), repr=False)
     connected: bool = True
     match_score: int = 0
 
@@ -81,7 +100,7 @@ class Room:
         state = {
             "code": self.code,
             "phase": self.phase,
-            "settings": asdict(self.settings),
+            "settings": self.settings.snapshot(),
             "players": [
                 {"id": player.id, "label": player.label, "host": player is self.host, "connected": player.connected}
                 for player in self.players
@@ -164,15 +183,51 @@ class Room:
         return {"winner_id": winner_id, "rounds_played": self.round.number}
 
     def finish_round(self, reason: str) -> bool:
-        """Freeze answers and add points only on the first completion."""
+        """Freeze the active round and either begin review or award scores."""
         if self.phase != "active" or self.round is None:
             return False
-        round_scores = self.round.submit(reason)
+        if self.settings.community_word_approval and self.round.begin_review(reason):
+            self.phase = "review"
+        else:
+            self._score_round(self.round, reason)
+        return True
+
+    def review_answer(self, reviewer: Player, number: int, target: str, category: str, decision: str) -> bool:
+        current_round = self.round
+        if current_round is not None and number != current_round.number:
+            raise RoomError("stale_round", "That action is for a different round.")
+        review = current_round.review if current_round is not None else None
+        if review is not None and self.phase in ("results", "finished"):
+            return False
+        if self.phase != "review" or review is None:
+            raise RoomError("review_required", "There is no round waiting for review.")
+        if target == reviewer.id:
+            raise RoomError("review_forbidden", "You can only review the other player's answers.")
+        entry = review.entries.get((target, category))
+        if entry is None:
+            raise RoomError("invalid_review", "That answer is not up for review.")
+        if entry.status != "pending":
+            return False
+        entry.status = "accepted" if decision == "accept" else "rejected"
+        return True
+
+    def finish_review(self) -> bool:
+        current_round = self.round
+        if self.phase != "review" or current_round is None or current_round.review is None:
+            return False
+        review, reason = current_round.review, current_round.ended_by
+        if reason is None or (review.has_pending() and review.seconds_remaining() > 0):
+            return False
+        review.reject_undecided()
+        self._score_round(current_round, reason)
+        return True
+
+    def _score_round(self, current_round: Round, reason: str) -> None:
+        round_scores = current_round.submit(reason)
         for player in self.players:
             player.match_score += round_scores[player.id]
-        reached_limit = self.settings.mode == "fixed" and self.round.number == self.settings.rounds
+        reached_limit = self.settings.mode == "fixed" and current_round.number == self.settings.rounds
         self.phase = "finished" if reached_limit else "results"
-        return True
 
 
 class RoomStore:
@@ -181,13 +236,15 @@ class RoomStore:
     def __init__(self) -> None:
         self.rooms: dict[str, Room] = {}
 
-    def create(self, settings: Settings) -> tuple[Room, Player]:
+    def create(self, settings: Settings, *, token: str | None = None) -> tuple[Room, Player]:
         self.prune()
+        if len(self.rooms) >= MAX_ROOMS:
+            raise RoomError("room_capacity", "The server has reached its room limit. Try again later.")
         while True:
             code = "".join(secrets.choice(CODE_ALPHABET) for _ in range(6))
             if code not in self.rooms:
                 break
-        host = Player("Player 1")
+        host = Player("Player 1", token_hash(token if token is not None else secrets.token_urlsafe(24)))
         room = Room(code, settings, [host])
         self.rooms[code] = room
         return room, host
@@ -198,28 +255,31 @@ class RoomStore:
         code = code.strip().upper()
         if len(code) != 6 or any(character not in CODE_ALPHABET for character in code):
             raise RoomError("invalid_code", "Enter the six-character room code.")
-        self.prune()
         room = self.rooms.get(code)
+        if room is not None and self._expired(room, monotonic()):
+            del self.rooms[code]
+            room = None
         if room is None:
             raise RoomError("room_not_found", "That room could not be found.")
         return room
 
-    def join(self, code: object) -> tuple[Room, Player]:
+    def join(self, code: object, *, token: str | None = None) -> tuple[Room, Player]:
         room = self.find(code)
         if room.phase != "lobby":
             raise RoomError("room_started", "This room has already started.")
         if len(room.players) == 2:
             raise RoomError("room_full", "This room already has two players.")
-        guest = Player("Player 2")
+        guest = Player("Player 2", token_hash(token if token is not None else secrets.token_urlsafe(24)))
         room.players.append(guest)
         room.empty_since = None
         return room, guest
 
     def resume(self, code: object, token: object) -> tuple[Room, Player]:
         room = self.find(code)
-        if isinstance(token, str) and re.fullmatch(r"[A-Za-z0-9_-]{32}", token):
+        if isinstance(token, str) and TOKEN_PATTERN.fullmatch(token):
+            supplied_hash = token_hash(token)
             for player in room.players:
-                if secrets.compare_digest(player.token, token):
+                if secrets.compare_digest(player.token_hash, supplied_hash):
                     if player.connected:
                         raise RoomError("duplicate_connection", "This player is already connected in another window.")
                     player.connected = True
@@ -227,13 +287,27 @@ class RoomStore:
                     return room, player
         raise RoomError("invalid_session", "This browser session could not rejoin the room.")
 
-    def disconnect(self, room: Room, player: Player) -> None:
+    def disconnect(self, room: Room, player: Player) -> bool:
+        if self.rooms.get(room.code) is not room or not player.connected:
+            return False
+        if not any(seat is player for seat in room.players):
+            return False
         player.connected = False
         if not any(player.connected for player in room.players):
             room.empty_since = monotonic()
+        return True
 
-    def prune(self) -> None:
-        expires_before = monotonic() - EMPTY_ROOM_GRACE
-        expired = [code for code, room in self.rooms.items() if room.empty_since is not None and room.empty_since <= expires_before]
-        for code in expired:
-            del self.rooms[code]
+    @staticmethod
+    def _expired(room: Room, now: float) -> bool:
+        return (
+            room.empty_since is not None
+            and now - room.empty_since >= EMPTY_ROOM_GRACE
+            and not any(player.connected for player in room.players)
+        )
+
+    def prune(self) -> list[Room]:
+        now = monotonic()
+        expired = [room for room in self.rooms.values() if self._expired(room, now)]
+        for room in expired:
+            del self.rooms[room.code]
+        return expired

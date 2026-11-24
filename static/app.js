@@ -27,16 +27,27 @@ const roundPanel = document.querySelector("#round-panel");
 const roundForm = document.querySelector("#round-form");
 const roundInputs = document.querySelector("#round-inputs");
 const doneButton = document.querySelector("#done-round");
+const reviewPanel = document.querySelector("#review-panel");
+const reviewOpponent = document.querySelector("#review-opponent");
+const reviewOwn = document.querySelector("#review-own");
+const reviewProgress = document.querySelector("#review-progress");
 const roundResults = document.querySelector("#round-results");
 const finalResults = document.querySelector("#final-results");
 const finalRoundTitle = document.querySelector("#final-round-title");
 const roundClock = document.querySelector("#round-clock");
 const roundTime = document.querySelector("#round-time");
+const roundTimeLabel = document.querySelector("#round-time-label");
 const answerStatusLabels = {
   blank: "Blank",
   invalid: "Invalid",
   valid: "Valid",
   duplicate: "Duplicate",
+};
+const reviewStatusLabels = {
+  pending: "Awaiting review",
+  accepted: "Accepted",
+  rejected: "Rejected",
+  timed_out: "Rejected after timeout",
 };
 const categoryLabels = {};
 for (const field of settingsTemplate.content.querySelectorAll("input[name=category]")) {
@@ -133,6 +144,7 @@ function readSettings(form, errorElement) {
     duration: Number(data.get("duration")),
     mode: data.get("mode"),
     rounds: data.has("rounds") ? Number(data.get("rounds")) : null,
+    community_word_approval: data.has("community_word_approval"),
   };
 }
 
@@ -140,6 +152,7 @@ function showSettings(settings) {
   document.querySelector("#current-categories").textContent = settings.categories.map((key) => categoryLabels[key]).join(", ");
   document.querySelector("#current-duration").textContent = `${settings.duration} seconds`;
   document.querySelector("#current-mode").textContent = settings.mode === "fixed" ? `${settings.rounds} fixed rounds` : "Endless";
+  document.querySelector("#current-community-word-approval").textContent = settings.community_word_approval ? "On" : "Off";
 
   // Connection updates should leave an unfinished host edit in place.
   const currentSettings = JSON.stringify(settings);
@@ -151,6 +164,7 @@ function showSettings(settings) {
   settingsForm.elements.duration.value = settings.duration;
   settingsForm.elements.mode.value = settings.mode;
   settingsForm.elements.rounds.value = settings.rounds ?? 5;
+  settingsForm.elements.community_word_approval.checked = settings.community_word_approval === true;
   updateRoundCount(settingsForm);
 }
 
@@ -209,6 +223,76 @@ function buildAnswerFields(categories) {
   roundInputs.replaceChildren(...fields);
 }
 
+function reviewStatus(status) {
+  const label = document.createElement("span");
+  label.className = "review-status";
+  label.dataset.status = status;
+  label.textContent = reviewStatusLabels[status];
+  return label;
+}
+
+function createReviewEntry(entry, roundNumber, reviewable) {
+  const row = document.createElement("li");
+  row.className = "review-entry";
+  row.dataset.category = entry.category;
+  row.tabIndex = -1;
+  const categoryName = categoryLabels[entry.category];
+  const category = document.createElement("span");
+  category.className = "review-category";
+  category.textContent = categoryName;
+  const answer = document.createElement("strong");
+  answer.textContent = entry.answer;
+  row.append(category, answer, reviewStatus(entry.status));
+  if (reviewable && entry.status === "pending") {
+    const actions = document.createElement("div");
+    actions.className = "actions review-actions";
+    for (const decision of ["accept", "reject"]) {
+      const button = document.createElement("button");
+      const verb = decision === "accept" ? "Accept" : "Reject";
+      button.type = "button";
+      button.dataset.decision = decision;
+      button.textContent = verb;
+      button.setAttribute("aria-label", `${verb} ${categoryName} answer`);
+      if (decision === "accept") button.className = "primary";
+      button.addEventListener("click", () => sendAction({
+        type: "review_answer",
+        round_number: roundNumber,
+        player_id: entry.player_id,
+        category: entry.category,
+        decision,
+      }));
+      actions.append(button);
+    }
+    row.append(actions);
+  }
+  return row;
+}
+
+function showReview(round) {
+  const entries = round.review.entries;
+  const own = entries.filter((entry) => entry.player_id === session?.player_id);
+  const opponent = entries.filter((entry) => entry.player_id !== session?.player_id);
+  const focused = document.activeElement;
+  const focusedCategory = reviewOpponent.contains(focused) ? focused.closest(".review-entry")?.dataset.category : null;
+  const rows = opponent.map((entry) => createReviewEntry(entry, round.number, true));
+  if (!rows.length) {
+    const empty = document.createElement("li");
+    empty.textContent = "No answers to review.";
+    rows.push(empty);
+  }
+  reviewOpponent.replaceChildren(...rows);
+  reviewOwn.replaceChildren(...own.map((entry) => createReviewEntry(entry, round.number, false)));
+  document.querySelector("#review-own-panel").hidden = own.length === 0;
+
+  const pending = entries.filter((entry) => entry.status === "pending").length;
+  reviewProgress.textContent = `${pending} ${pending === 1 ? "answer" : "answers"} awaiting review.`;
+  if (focusedCategory) {
+    const row = rows.find((item) => item.dataset.category === focusedCategory);
+    const button = row?.querySelector(`[data-decision="${focused.dataset.decision}"]`);
+    (button ?? row)?.focus();
+  }
+}
+
 function showResults(round) {
   const headers = ["Category", ...room.players.map((player) => player.label)];
   document.querySelector("#results-players").replaceChildren(...headers.map((header) => {
@@ -246,6 +330,12 @@ function showResults(round) {
       points.textContent = `${result.points} pts`;
       details.append(status, points);
       cell.append(details);
+      const reviewed = round.review?.entries.find((entry) => entry.player_id === player.id && entry.category === category);
+      if (reviewed) {
+        const decision = reviewStatus(reviewed.status);
+        decision.classList.add("review-decision");
+        cell.append(decision);
+      }
       row.append(cell);
     }
     return row;
@@ -272,6 +362,9 @@ function showResults(round) {
   document.querySelector("#results-totals").replaceChildren(...totalRows);
   document.querySelector("#round-ended-message").textContent =
     round.ended_by === "timeout" ? "Time ran out." : "A player clicked Done.";
+  document.querySelector("#results-note").textContent = room.settings.community_word_approval
+    ? "Eligible words outside the built-in list count only if the other player accepts them."
+    : "Word Rally checks a built-in list for each category. Words missing from the list are marked Invalid.";
 }
 
 function showFinalResults() {
@@ -294,16 +387,18 @@ function showFinalResults() {
 function showRound(previousRoom) {
   const round = room.round;
   const active = room.phase === "active";
+  const reviewing = room.phase === "review";
   const finished = room.phase === "finished";
   const scored = room.phase === "results" || finished;
   roundPanel.hidden = !round;
   roundForm.hidden = !active;
-  roundClock.hidden = !active;
+  roundClock.hidden = !active && !reviewing;
+  reviewPanel.hidden = !reviewing;
   roundResults.hidden = !scored;
   finalResults.hidden = !finished;
   finalRoundTitle.hidden = !finished;
 
-  if (!active) stopCountdown();
+  if (!active && !reviewing) stopCountdown();
   if (!round) return;
 
   const newRound = previousRoom?.code !== room.code || previousRoom?.round?.number !== round.number;
@@ -315,12 +410,20 @@ function showRound(previousRoom) {
         field.value = restoredDrafts.answers[field.name] ?? "";
       }
     }
-    countdownDeadline = performance.now() + round.remaining_ms;
-    updateCountdown();
-    if (countdownInterval === null) countdownInterval = setInterval(updateCountdown, 100);
+  } else if (reviewing) {
+    if (newRound || previousRoom?.phase !== "review" ||
+        JSON.stringify(previousRoom.round.review.entries) !== JSON.stringify(round.review.entries)) {
+      showReview(round);
+    }
   } else if (scored && (newRound || previousRoom?.phase !== room.phase)) {
     showResults(round);
     if (finished) showFinalResults();
+  }
+  if (active || reviewing) {
+    roundTimeLabel.textContent = reviewing ? "Review time remaining" : "Time remaining";
+    countdownDeadline = performance.now() + (reviewing ? round.review.remaining_ms : round.remaining_ms);
+    updateCountdown();
+    if (countdownInterval === null) countdownInterval = setInterval(updateCountdown, 100);
   }
   restoredDrafts = null;
 }
@@ -335,6 +438,7 @@ function updateControls() {
   const bothConnected = room.players.length === 2 && room.players.every((player) => player.connected);
   const inLobby = room.phase === "lobby";
   const inResults = room.phase === "results";
+  const reviewing = room.phase === "review";
   const finished = room.phase === "finished";
   const ownReady = inResults && room.ready[session?.player_id];
   const canEndMatch = inResults && room.settings.mode === "endless";
@@ -354,6 +458,9 @@ function updateControls() {
   returnHomeButton.hidden = connected || finished;
   roundInputs.disabled = !canAnswer;
   doneButton.disabled = !canAnswer;
+  for (const button of reviewOpponent.querySelectorAll("button")) {
+    button.disabled = !reviewing || !connected || Boolean(pendingAction);
+  }
 
   if (inLobby) {
     lobbyTitle.textContent = "Room lobby";
@@ -367,7 +474,11 @@ function updateControls() {
     roomStatus.textContent = "";
   } else {
     const title = `Round ${room.round.number}`;
-    lobbyTitle.textContent = inResults ? `${title} ended` : title;
+    if (reviewing) {
+      lobbyTitle.textContent = `${title} review`;
+    } else {
+      lobbyTitle.textContent = inResults ? `${title} ended` : title;
+    }
     const otherPlayer = room.players.find((player) => player.id !== session?.player_id);
     if (!otherPlayer?.connected) {
       roomStatus.textContent = "The other player is disconnected.";
@@ -378,9 +489,13 @@ function updateControls() {
 }
 
 function keepPendingAction() {
-  if (pendingAction === "done") return room.phase === "active";
-  if (pendingAction === "end_match") return room.phase === "results";
-  if (pendingAction === "ready") return room.phase === "results" && !room.ready[session?.player_id];
+  if (pendingAction?.type === "done") return room.phase === "active";
+  if (pendingAction?.type === "end_match") return room.phase === "results";
+  if (pendingAction?.type === "ready") return room.phase === "results" && !room.ready[session?.player_id];
+  if (pendingAction?.type === "review_answer" && room.phase === "review" && room.round.number === pendingAction.round_number) {
+    return room.round.review.entries.some((entry) => entry.player_id === pendingAction.player_id &&
+      entry.category === pendingAction.category && entry.status === "pending");
+  }
   return false;
 }
 
@@ -484,7 +599,7 @@ function connect(request) {
 
 function sendAction(message) {
   if (!connected || pendingAction || socket?.readyState !== WebSocket.OPEN) return;
-  pendingAction = message.type;
+  pendingAction = message;
   setError(lobbyError);
   updateControls();
   socket.send(JSON.stringify(message));

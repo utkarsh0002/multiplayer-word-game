@@ -1,6 +1,6 @@
 # Word Rally
 
-Word Rally is a two-player browser word game with Fixed and Endless matches. Both players enter answers privately and then see both sets of answers, their statuses, and their round and cumulative match scores. Milestone 5 adds multiple rounds and final results.
+Word Rally is a two-player browser word game with Fixed and Endless matches. Both players enter answers privately and then see both sets of answers, their statuses, and their round and cumulative match scores. Hosts can opt into Community Word Approval for eligible answers absent from the built-in lists.
 
 ## Run locally
 
@@ -27,25 +27,39 @@ On macOS or Linux, use `./.venv/bin/python` in place of `.\.venv\Scripts\python.
 9. To try Endless mode, create and join a new Endless room. From between-round results, either player can choose **End Match**. Cancel to stay on results, or confirm to show the final scores on both screens.
 10. For the timer path, create a room with a 15-second timer. Start, enter an answer, and let the timer expire. The scored round details should show **Time ran out** and the same submitted answers in both windows.
 
-## Run the backend tests
+### Try Community Word Approval
+
+1. Check **Community Word Approval** when creating a room, or enable it as host in the lobby. Leave it unchecked to keep strict word-list scoring.
+2. Submit an answer that fits the category and starts with the shared letter but is absent from its [built-in list](word_lists.py). Both windows enter review after the round. The opposing player sees **Accept** and **Reject** for that answer.
+3. Decide before the shared 15-second timer expires. Eligible answers without a decision are automatically rejected. When the review ends, both windows show the final decisions and scores. The timer continues if one player disconnects or reloads.
+
+## Run the checks
 
 ```powershell
 .\.venv\Scripts\python.exe -B -m unittest discover -s tests -v
+node --check static/app.js
 ```
 
-The tests include local Uvicorn servers and real WebSocket connections. They cover lobby behavior, private drafts, Done and timeout, answer validation and scoring, Ready, multiple rounds, match completion, and reconnects.
+The tests include local Uvicorn servers and real WebSocket connections. They cover lobby behavior, private drafts, Done and timeout, validation and scoring, Ready, multiple rounds, and match completion. Hardening tests also exercise malformed messages, unauthorized access, room expiration, simultaneous actions, and recovery from internal failures.
 
 ## How the server runs a match
 
 - `main.py` serves the home page, health check, and `/ws` endpoint. The `websockets` dependency lets Uvicorn accept WebSocket connections.
 - `rooms.py` owns in-memory room state and phase transitions. From `results`, both players must be ready and connected to start the next round. A Fixed match reaches `finished` as soon as the last round is scored. An Endless match reaches `finished` when either player ends it from `results`. Transitions run without an `await` on one event loop, so competing requests cannot submit a round or start its successor twice.
-- `rounds.py` tracks the round and freezes a trimmed, case-preserving copy of the drafts on submission. `scoring.py` case-folds those answers for comparison, then checks the round letter and the lists in `word_lists.py`. The room adds each player's round score to their match total once.
-- `lobby.py` associates each WebSocket with its server-assigned player and schedules one timer per active room. It checks the deadline before it accepts an action, even if the timer callback is still waiting to run. Resume restores only the returning player's drafts. The deadline keeps running through disconnects.
-- `static/app.js` sends drafts as the player types. Its countdown displays the server's remaining time. The browser renders Ready choices, scores, and the final outcome from the shared server state.
+- `rounds.py` tracks the round and freezes a trimmed, case-preserving copy of the drafts on submission. `review.py` handles eligible unlisted candidates when approval is enabled. `scoring.py` uses the assigned letter, built-in word lists, and any final review decisions. The room adds each player's round score to their match total once.
+- `lobby.py` associates each WebSocket with its server-assigned player and schedules one timer for the timed phase. It checks deadlines before accepting actions. Resume restores only the returning player's active drafts and the current shared review state. Deadlines keep running through disconnects.
+- `static/app.js` sends drafts as the player types. Its countdowns display the server's remaining time. The browser renders review decisions, Ready choices, scores, and the final outcome from the shared server state.
 
 Rooms and sessions are lost when the backend process restarts, including during a code reload. Run a single backend process. A disconnected player's seat stays reserved with its score and current Ready choice. The active timer continues, and between-round progression waits for both seats to reconnect. A room is eligible for cleanup after every player has been disconnected for ten minutes.
 
-The built-in word lists are starter data. A plausible answer is marked Invalid when its exact spelling after trimming and case folding is absent from the selected category list.
+The built-in word lists are starter data. With Community Word Approval off, an answer is invalid if its exact normalized spelling is absent from the category list. With it on, a well-formed unlisted word or phrase with the correct starting letter can earn points if the opponent accepts it. Decisions apply only to the current round.
+
+## Backend limits and logs
+
+- Keep `--ws-max-size 4096` in the local run command for a transport-level limit. The app separately validates input and limits admission attempts, send queues, and retained rooms. See [ARCHITECTURE.md](ARCHITECTURE.md#websocket-protocol) for details.
+- The shareable room code opens an unclaimed guest seat. Rejoining an occupied seat requires its private token. Keep that token and raw WebSocket frames out of shared logs or screenshots.
+- For an unexpected failure, the `lobby` logger records `internal_error`, an operation name, and an exception class without raw message or exception contents. Share that line and the failing test name if reporting a regression.
+- This is a local single-process setup. Deployment and public-traffic controls are outside the current project setup.
 
 ## WebSocket protocol
 
@@ -60,6 +74,7 @@ Messages are JSON objects with a `type`. Clients identify themselves before send
 | Client → server | `start` | Host only, when both players are connected. Starts round 1 and changes `phase` to `active`. |
 | Client → server | `draft` | `round_number`, `category`, `answer`. Saves text up to 80 characters for this connection's player. |
 | Client → server | `done` | `round_number`. Either player can end the active round, including with blank answers. |
+| Client → server | `review_answer` | `round_number`, candidate owner's `player_id`, `category`, and `decision` (`accept` or `reject`). Only the opponent can decide a candidate. |
 | Client → server | `ready` | `round_number`. Marks the caller ready on the current between-round results. |
 | Client → server | `end_match` | `round_number`. Either player can finish an Endless match from the current between-round results. |
 | Server → client | `session` | `code`, `player_id`, and `token`. Sent to the identifying connection. |
@@ -68,6 +83,6 @@ Messages are JSON objects with a `type`. Clients identify themselves before send
 | Server → client | `draft_saved` | `round_number` and `category`. Sent only to the player whose draft was accepted. |
 | Server → client | `error` | `code` and a readable `message`. Sent to the requesting client. |
 
-Settings contain `categories` (one or more of `animals`, `countries`, `food`, `sports`, `cities`), `duration` (15–180 seconds), `mode` (`fixed` or `endless`), and `rounds` (1–20 for fixed, `null` for endless). Room codes use six uppercase letters or digits selected from an alphabet that omits easily confused characters. The server also accepts lowercase codes.
+Settings contain `categories` (one or more of `animals`, `countries`, `food`, `sports`, `cities`), `duration` (15–180 seconds), `mode` (`fixed` or `endless`), and `rounds` (1–20 for fixed, `null` for endless). Optional `community_word_approval` defaults to `false`. Room codes use six uppercase letters or digits selected from an alphabet that omits easily confused characters. The server also accepts lowercase codes.
 
-In `results` or `finished`, `room.round` includes the submitted answers, their status and points by category, and each player's round total. `room.match_scores` gives the cumulative totals. `room.ready` appears in `results`, and `room.final_result` appears in `finished`. See [ARCHITECTURE.md](ARCHITECTURE.md#websocket-protocol) for the full message contract.
+For reviewed rounds, `room.round.review` carries the deadline and decisions. In `results` or `finished`, `room.round` includes the submitted answers, their status and points by category, and each player's round total. `room.match_scores` gives the cumulative totals. `room.ready` appears in `results`, and `room.final_result` appears in `finished`. See [ARCHITECTURE.md](ARCHITECTURE.md#websocket-protocol) for the full message contract.

@@ -1,11 +1,34 @@
 import asyncio
-import json
-from contextlib import suppress
+import logging
+import secrets
 
 from fastapi import WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
 
+from protocol import receive_message
 from rooms import Player, Room, RoomError, RoomStore, Settings
 from rounds import MAX_ANSWER_LENGTH, Round
+
+
+logger = logging.getLogger(__name__)
+MAX_ADMISSION_ATTEMPTS = 16
+SEND_TIMEOUT = 5
+
+
+def log_internal_error(operation: str, error: BaseException) -> None:
+    # Exception messages and tracebacks can contain payload data or credentials.
+    logger.error("internal_error operation=%s exception=%s", operation, type(error).__name__)
+
+
+async def close_socket(socket: WebSocket, code: int) -> None:
+    if socket.application_state is WebSocketState.DISCONNECTED:
+        return
+    try:
+        await asyncio.wait_for(socket.close(code=code), timeout=SEND_TIMEOUT)
+    except (WebSocketDisconnect, OSError, asyncio.TimeoutError):
+        pass
+    except Exception as error:
+        log_internal_error("socket_close", error)
 
 
 class Client:
@@ -28,26 +51,13 @@ class Client:
         while True:
             message = await self.messages.get()
             if message is None:
-                await socket.close(code=1013)
+                await close_socket(socket, 1013)
                 return
-            await socket.send_json(message)
-
-
-async def receive_message(socket: WebSocket) -> dict:
-    event = await socket.receive()
-    if event["type"] == "websocket.disconnect":
-        raise WebSocketDisconnect(event.get("code", 1000))
-
-    text = event.get("text")
-    if text is None or len(text.encode("utf-8")) > 4096:
-        raise RoomError("invalid_message", "Send a JSON text message of at most 4096 bytes.")
-    try:
-        message = json.loads(text)
-    except (ValueError, RecursionError) as error:
-        raise RoomError("invalid_message", "The message is not valid JSON.") from error
-    if not isinstance(message, dict) or not isinstance(message.get("type"), str):
-        raise RoomError("invalid_message", "Each message needs a type.")
-    return message
+            try:
+                await asyncio.wait_for(socket.send_json(message), timeout=SEND_TIMEOUT)
+            except asyncio.TimeoutError:
+                await close_socket(socket, 1013)
+                return
 
 
 def error_message(error: RoomError) -> dict:
@@ -65,42 +75,57 @@ class Lobby:
     def __init__(self, rooms: RoomStore) -> None:
         self.rooms = rooms
         self.clients: dict[str, Client] = {}
-        self.round_timers: dict[str, asyncio.TimerHandle] = {}
+        self.round_timers: dict[int, asyncio.TimerHandle] = {}
 
-    def admit(self, message: dict) -> tuple[Room, Player]:
+    def admit(self, message: dict) -> tuple[Room, Player, str]:
         match message["type"]:
-            case "create" if message.keys() == {"type"}:
-                return self.rooms.create(Settings())
-            case "create" if message.keys() == {"type", "settings"}:
-                return self.rooms.create(Settings.parse(message["settings"]))
+            case "create" if message.keys() in ({"type"}, {"type", "settings"}):
+                settings = Settings.parse(message["settings"]) if "settings" in message else Settings()
+                token = secrets.token_urlsafe(24)
+                room, player = self.rooms.create(settings, token=token)
             case "join" if message.keys() == {"type", "code"}:
-                return self.rooms.join(message["code"])
+                token = secrets.token_urlsafe(24)
+                room, player = self.rooms.join(message["code"], token=token)
             case "resume" if message.keys() == {"type", "code", "token"}:
-                return self.rooms.resume(message["code"], message["token"])
+                token = message["token"]
+                room, player = self.rooms.resume(message["code"], token)
             case _:
                 raise RoomError("invalid_message", "First create, join, or rejoin a room.")
+        return room, player, token
 
-    async def identify(self, socket: WebSocket) -> tuple[Room, Player]:
+    async def identify(self, socket: WebSocket) -> tuple[Room, Player, str]:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + 10
-        while True:
+        for _ in range(MAX_ADMISSION_ATTEMPTS):
             try:
                 message = await asyncio.wait_for(receive_message(socket), deadline - loop.time())
                 return self.admit(message)
             except RoomError as error:
-                await socket.send_json(error_message(error))
+                await asyncio.wait_for(socket.send_json(error_message(error)), deadline - loop.time())
+        raise asyncio.TimeoutError
 
     def broadcast(self, room: Room) -> None:
+        if self.rooms.rooms.get(room.code) is not room:
+            return
         message = {"type": "state", "room": room.snapshot()}
         for player in room.players:
             client = self.clients.get(player.id)
             if client is not None:
                 client.send(message)
 
-    def schedule_deadline(self, room: Room, current_round: Round) -> None:
+    def cancel_room_timer(self, room: Room) -> None:
+        timer = self.round_timers.pop(id(room), None)
+        if timer is not None:
+            timer.cancel()
+
+    def schedule_deadline(self, room: Room, current_round: Round, *, retry: bool = False) -> None:
         loop = asyncio.get_running_loop()
-        self.round_timers[room.code] = loop.call_later(
-            current_round.seconds_remaining(), self.on_deadline, room, current_round
+        self.cancel_room_timer(room)
+        phase = room.phase
+        clock = current_round.review if phase == "review" else current_round
+        delay = 1 if retry else clock.seconds_remaining()
+        self.round_timers[id(room)] = loop.call_later(
+            delay, self.on_deadline, room, current_round, retry, phase
         )
 
     def start_ready_round(self, room: Room) -> None:
@@ -108,21 +133,42 @@ class Lobby:
         if current_round is not None:
             self.schedule_deadline(room, current_round)
 
-    def on_deadline(self, room: Room, current_round: Round) -> None:
-        if room.phase != "active" or room.round is not current_round:
+    def on_deadline(self, room: Room, current_round: Round, retry: bool = False, phase: str = "active") -> None:
+        if room.phase != phase or room.round is not current_round:
             return
-        if not self.expire_round_if_due(room):
-            # The event loop can fire a scheduled callback slightly early.
-            self.schedule_deadline(room, current_round)
+        self.cancel_room_timer(room)
+        if self.rooms.rooms.get(room.code) is not room:
+            return
+        try:
+            if not self.expire_deadline_if_due(room):
+                # The event loop can fire a scheduled callback slightly early.
+                self.schedule_deadline(room, current_round)
+        except Exception as error:
+            log_internal_error("review_deadline" if phase == "review" else "round_deadline", error)
+            if not retry and room.phase == phase and room.round is current_round:
+                self.schedule_deadline(room, current_round, retry=True)
 
     def finish_round(self, room: Room, reason: str) -> bool:
         if not room.finish_round(reason):
             return False
-        timer = self.round_timers.pop(room.code, None)
-        if timer is not None:
-            timer.cancel()
+        if room.phase == "review":
+            self.schedule_deadline(room, room.round)
+        else:
+            self.cancel_room_timer(room)
         self.broadcast(room)
         return True
+
+    def finish_review(self, room: Room) -> bool:
+        if not room.finish_review():
+            return False
+        self.cancel_room_timer(room)
+        self.broadcast(room)
+        return True
+
+    def expire_deadline_if_due(self, room: Room) -> bool:
+        if room.phase == "review":
+            return self.finish_review(room)
+        return self.expire_round_if_due(room)
 
     def expire_round_if_due(self, room: Room) -> bool:
         return (
@@ -137,7 +183,7 @@ class Lobby:
 
     def apply_round_action(self, client: Client, room: Room, player: Player, message: dict) -> None:
         number = require_round_number(message)
-        if room.phase in ("results", "finished"):
+        if room.phase in ("review", "results", "finished"):
             return
         current_round = room.round
         if room.phase != "active" or current_round is None:
@@ -156,7 +202,9 @@ class Lobby:
         while True:
             try:
                 message = await receive_message(socket)
-                self.expire_round_if_due(room)
+                if self.clients.get(player.id) is not client or self.rooms.rooms.get(room.code) is not room:
+                    return
+                expired_before_command = self.expire_deadline_if_due(room)
                 match message["type"]:
                     case "start" if message.keys() == {"type"}:
                         current_round = room.start(player)
@@ -169,33 +217,83 @@ class Lobby:
                         self.apply_round_action(client, room, player, message)
                     case "done" if message.keys() == {"type", "round_number"}:
                         self.apply_round_action(client, room, player, message)
-                    case "ready" if message.keys() == {"type", "round_number"}:
-                        if room.mark_ready(player, require_round_number(message)):
-                            self.start_ready_round(room)
-                            self.broadcast(room)
-                    case "end_match" if message.keys() == {"type", "round_number"}:
-                        if room.end_match(require_round_number(message)):
-                            self.broadcast(room)
+                    case "ready" | "end_match" if message.keys() == {"type", "round_number"}:
+                        self.apply_results_action(room, player, message, expired_before_command)
+                    case "review_answer" if message.keys() == {"type", "round_number", "player_id", "category", "decision"}:
+                        self.apply_review_answer(room, player, message, expired_before_command)
                     case _:
                         raise RoomError("invalid_message", "That action is not supported.")
             except RoomError as error:
                 client.send(error_message(error))
+            # A buffered receive can complete immediately. Give timers and other seats a turn.
+            await asyncio.sleep(0)
+
+    def apply_review_answer(self, room: Room, player: Player, message: dict, expired_before_command: bool) -> None:
+        number = require_round_number(message)
+        target, category, decision = message["player_id"], message["category"], message["decision"]
+        if not isinstance(target, str) or not isinstance(category, str) or decision not in ("accept", "reject"):
+            raise RoomError("invalid_message", "Send a player, category, and an accept or reject decision.")
+        if expired_before_command and room.phase == "review":
+            raise RoomError("review_required", "Wait for the review to begin before voting.")
+        if room.review_answer(player, number, target, category, decision) and not self.finish_review(room):
+            self.broadcast(room)
+
+    def apply_results_action(self, room: Room, player: Player, message: dict, expired_before_command: bool) -> None:
+        number = require_round_number(message)
+        if expired_before_command and room.phase == "results" and room.round is not None and number == room.round.number:
+            raise RoomError("results_required", "Wait for the round to end before using this action.")
+
+        if message["type"] == "ready":
+            if not room.mark_ready(player, number):
+                return
+            self.start_ready_round(room)
+        elif not room.end_match(number):
+            return
+        self.broadcast(room)
+
+    async def run_client(self, socket: WebSocket, client: Client, room: Room, player: Player) -> None:
+        tasks = (
+            asyncio.create_task(self.read_commands(socket, client, room, player)),
+            asyncio.create_task(client.write_messages(socket)),
+        )
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in tasks:
+                task.cancel()
+            outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+
+        failed = False
+        for operation, outcome in zip(("socket_read", "socket_write"), outcomes):
+            if isinstance(outcome, Exception) and not isinstance(outcome, (WebSocketDisconnect, OSError)):
+                log_internal_error(operation, outcome)
+                failed = True
+        if failed:
+            await close_socket(socket, 1011)
 
     async def connect(self, socket: WebSocket) -> None:
-        origin = socket.headers.get("origin")
-        scheme = "https" if socket.url.scheme == "wss" else "http"
-        if origin is not None and origin != f"{scheme}://{socket.headers.get('host')}":
-            await socket.close(code=1008)
-            return
-
-        await socket.accept()
         try:
-            room, player = await self.identify(socket)
-            client = Client()
-            self.clients[player.id] = client
+            origins = socket.headers.getlist("origin")
+            hosts = socket.headers.getlist("host")
+            scheme = "https" if socket.url.scheme == "wss" else "http"
+            if len(hosts) != 1 or (origins and origins != [f"{scheme}://{hosts[0]}"]):
+                await close_socket(socket, 1008)
+                return
+
+            await socket.accept()
             try:
-                client.send({"type": "session", "code": room.code, "player_id": player.id, "token": player.token})
-                if not self.expire_round_if_due(room):
+                room, player, token = await self.identify(socket)
+            except asyncio.TimeoutError:
+                await close_socket(socket, 1008)
+                return
+
+            client = None
+            try:
+                client = Client()
+                self.clients[player.id] = client
+                client.send({"type": "session", "code": room.code, "player_id": player.id, "token": token})
+                del token
+                if not self.expire_deadline_if_due(room):
                     self.start_ready_round(room)
                     if room.phase == "active" and room.round is not None:
                         client.send({
@@ -204,27 +302,23 @@ class Lobby:
                             "answers": room.round.drafts[player.id].copy(),
                         })
                     self.broadcast(room)
-                reader = asyncio.create_task(self.read_commands(socket, client, room, player))
-                writer = asyncio.create_task(client.write_messages(socket))
-                try:
-                    done, _ = await asyncio.wait((reader, writer), return_when=asyncio.FIRST_COMPLETED)
-                    for task in done:
-                        task.result()
-                finally:
-                    reader.cancel()
-                    writer.cancel()
-                    await asyncio.gather(reader, writer, return_exceptions=True)
+                await self.run_client(socket, client, room, player)
             finally:
-                del self.clients[player.id]
-                self.rooms.disconnect(room, player)
-                self.broadcast(room)
-        except asyncio.TimeoutError:
-            with suppress(WebSocketDisconnect, OSError):
-                await socket.close(code=1008)
+                if self.clients.get(player.id) is client:
+                    self.clients.pop(player.id, None)
+                    if self.rooms.disconnect(room, player):
+                        self.broadcast(room)
         except (WebSocketDisconnect, OSError):
             pass
+        except Exception as error:
+            log_internal_error("socket_lifecycle", error)
+            await close_socket(socket, 1011)
 
     async def prune_empty_rooms(self) -> None:
         while True:
             await asyncio.sleep(30)
-            self.rooms.prune()
+            try:
+                for room in self.rooms.prune():
+                    self.cancel_room_timer(room)
+            except Exception as error:
+                log_internal_error("room_cleanup", error)

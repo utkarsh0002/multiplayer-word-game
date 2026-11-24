@@ -92,6 +92,16 @@
             <fieldset id="round-inputs" class="round-inputs"></fieldset>
             <button class="primary" id="done-round" type="submit">Done</button>
           </form>
+          <section id="review-panel" aria-label="Community word approval" hidden>
+            <p class="review-help">Judge whether your opponent's words fit their categories. Undecided answers are rejected when time runs out.</p>
+            <p id="review-progress" class="review-progress" role="status"></p>
+            <h2 id="review-opponent-title" tabindex="-1">Opponent's answers</h2>
+            <ul id="review-opponent" class="review-list" aria-labelledby="review-opponent-title"></ul>
+            <section id="review-own-panel" aria-labelledby="review-own-title" hidden>
+              <h2 id="review-own-title">Your answers under review</h2>
+              <ul id="review-own" class="review-list" aria-labelledby="review-own-title"></ul>
+            </section>
+          </section>
           <section id="round-results" aria-labelledby="results-title" hidden>
             <p id="round-ended-message"></p>
             <h2 id="results-title">Submitted answers</h2>
@@ -100,7 +110,7 @@
               <tbody id="results-answers"></tbody>
               <tfoot id="results-totals"></tfoot>
             </table>
-            <p class="results-note">Word Rally checks a built-in list for each category. Words missing from the list are marked Invalid.</p>
+            <p id="results-note" class="results-note">Word Rally checks a built-in list for each category. Words missing from the list are marked Invalid.</p>
           </section>
         </div>
 
@@ -132,6 +142,7 @@
             <dt>Categories</dt><dd id="current-categories"></dd>
             <dt>Round timer</dt><dd id="current-duration"></dd>
             <dt>Game mode</dt><dd id="current-mode"></dd>
+            <dt>Community word approval</dt><dd id="current-community-word-approval"></dd>
           </dl>
           <details id="host-settings" hidden>
             <summary>Edit settings</summary>
@@ -177,6 +188,10 @@
         </label>
         <label class="round-count">Round count <input name="rounds" type="number" min="1" max="20" value="5" required></label>
       </div>
+      <label class="community-option">
+        <input type="checkbox" name="community_word_approval">
+        Community word approval
+      </label>
     </template>
   </body>
 </html>
