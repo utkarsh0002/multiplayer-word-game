@@ -1,10 +1,10 @@
 # Word Rally architecture
 
-This document describes the implementation through Milestone 6A.1. See [GAME_DESIGN.md](GAME_DESIGN.md) for game rules and [PROGRESS.md](PROGRESS.md) for milestone status.
+This document includes Milestone 6A.2 persistent room chat. See [GAME_DESIGN.md](GAME_DESIGN.md) for game rules and [PROGRESS.md](PROGRESS.md) for milestone status.
 
 ## Runtime and module boundaries
 
-Word Rally runs in one Uvicorn process with a FastAPI backend and a browser frontend built with HTML, CSS, and vanilla JavaScript. Rooms, player sessions, and rounds live in process memory. A process restart or development reload clears them. The single-process design puts room mutations on one event loop.
+Word Rally runs in one Uvicorn process with a FastAPI backend and a browser frontend built with HTML, CSS, and vanilla JavaScript. Rooms, player sessions, rounds, and room chat live in process memory. A process restart or development reload clears them. The single-process design puts room mutations on one event loop.
 
 | File | Responsibility |
 | --- | --- |
@@ -15,6 +15,7 @@ Word Rally runs in one Uvicorn process with a FastAPI backend and a browser fron
 | [scoring.py](scoring.py) | Compares trimmed, case-folded answers against the letter and category list, accounts for accepted community answers, and calculates statuses and points from final validity. |
 | [word_lists.py](word_lists.py) | Holds the editable starter word lists. Its keys supply the room's category options. The server uses normalized sets for exact lookup. |
 | [lobby.py](lobby.py) | Validates and routes WebSocket messages, binds sockets to seats, schedules round and review deadline callbacks, and queues room snapshots and private messages for delivery. |
+| [chat.py](chat.py) | Keeps each room's latest 50 chat messages, validates text, assigns sequence numbers, and tracks each seat's send rate. |
 | [protocol.py](protocol.py) | Parses bounded UTF-8 JSON envelopes and rejects ambiguous or malformed input before command handling. |
 | [static/index.html](static/index.html), [static/styles.css](static/styles.css), [static/app.js](static/app.js) | Define and render the home, lobby, active round, review, and results views. The browser sends actions and renders the latest server state. |
 
@@ -31,7 +32,7 @@ A disconnect updates the seat's connection flag and broadcasts to the remaining 
 1. The host's initial `start` changes `lobby` to `active` and creates round 1 from the room's selected categories and duration. Subsequent rounds increment the round number, draw a letter independently from `A` through `Z`, and start with blank drafts, a new deadline, and fresh round scores. Both clients receive the same round metadata.
 2. `Lobby` schedules a deadline callback with the event loop's `call_later()` method. Timing decisions use a monotonic server clock. Timer ownership follows the room object, and each callback checks the current phase, round, and store membership before acting. The browser uses server-supplied `remaining_ms` and `performance.now()` for countdown displays.
 3. Each accepted `draft` replaces that seat's saved answer for one configured category. It stays private until submission. An active resume restores the caller's own drafts before the first shared room snapshot.
-4. `Done` and timeout call the same completion path. The handler checks for expiration before applying a parsed command. A Done received at or after the deadline resolves as a timeout. A Ready or End Match command that encounters the active round and triggers its expiration must be sent again from results. If the timer callback wakes early, it schedules the remaining delay again.
+4. `Done` and timeout call the same completion path. The handler checks for expiration before applying a parsed game command. A Done received at or after the deadline resolves as a timeout. A Ready or End Match command that encounters the active round and triggers its expiration must be sent again from results. If the timer callback wakes early, it schedules the remaining delay again.
 5. The first completion synchronously copies and trims both players' drafts and records `done` or `timeout`. When Community Word Approval is enabled and at least one frozen answer qualifies, the room enters `review`. Otherwise it scores the frozen submissions immediately.
 6. Review replaces the play timer with one 15-second deadline shared by both seats. Only the opposing seat can decide each candidate, and the first valid decision is final. When every decision is final, or the timer marks all undecided entries timed out, the server scores exactly once from final validity and updates cumulative totals. The room moves to `results`, or to `finished` after the configured final round in Fixed mode. All transitions run synchronously on the same event loop.
 7. During `results`, the server records Ready for the requesting seat and starts the next round only when both seats are ready and connected. A reconnect can satisfy the connection condition without either player pressing Ready again. The same synchronous transition clears Ready and starts the new round, so duplicate or simultaneous messages cannot create extra rounds.
@@ -55,6 +56,8 @@ Connect to `/ws` on the same host. The server requires a single `Host` header an
 | Identified | `review_answer` | `round_number`, `player_id`, `category`, `decision` | Decides one opponent candidate in the current `review`. `player_id` is the seat that submitted the word, and `decision` is `accept` or `reject`. |
 | Identified | `ready` | `round_number` | Marks the requesting seat ready during the identified round's `results`. Starts the next round when both seats are ready and connected. |
 | Identified | `end_match` | `round_number` | Finishes an Endless match from the identified round's `results`. Either seat can request it. |
+| Identified | `chat_subscribe` | None | Subscribes the socket after both seats are claimed and returns an ordered history snapshot. Repeat subscriptions on the same socket have no effect. |
+| Identified | `chat_send` | `text` | Appends one message for the bound seat after it subscribes. |
 
 Room codes accept lowercase and surrounding whitespace. Settings carry `categories`, `duration`, `mode`, and `rounds`, with an optional boolean `community_word_approval`. Categories are a nonempty array of distinct entries from `animals`, `countries`, `food`, `sports`, and `cities`. Duration is an integer from 15 to 180 seconds. `fixed` uses an integer round count from 1 to 20. `endless` requires `rounds: null`. Defaults are all five categories, 60 seconds, five fixed rounds, and `community_word_approval: false`. The room snapshot includes `community_word_approval` only when enabled and retains the earlier settings shape when disabled.
 
@@ -71,6 +74,9 @@ Room codes accept lowercase and surrounding whitespace. Settings carry `categori
 | `state` | `room` | Shared with connected room members after admission, disconnect, changes to settings or Ready, round and review transitions, review decisions, scoring, or match completion. Results include scored answers and totals from the server. |
 | `draft_saved` | `round_number`, `category` | Private acknowledgment for each accepted `draft`. The browser currently uses the active resume message to restore inputs. |
 | `error` | `code`, `message` | Private response to the requesting connection. |
+| `chat_history` | `messages` | Sent once to the subscribing socket. The array contains retained messages, oldest first, and may be empty. |
+| `chat_message` | `message` | One newly accepted entry, delivered to subscribed sockets in the room, including the sender. |
+| `chat_error` | `code`, `message` | Safe chat command error sent to the requesting socket. |
 
 The `room` object contains `code`, `phase`, `settings`, and `players`. The `players` array has one entry per allocated seat with `id`, `label`, `host`, and `connected`. During `lobby` the `round` key is absent. During `results` and `finished`, `room.match_scores` maps player IDs to integer cumulative totals. During `results` only, `room.ready` maps player IDs to booleans. During `finished` only, `room.final_result` contains `winner_id` (a player ID or `null` for a draw) and the integer `rounds_played`. During `active`, `review`, `results`, and `finished`, `room.round` contains these fields.
 
@@ -85,11 +91,23 @@ The `room` object contains `code`, `phase`, `settings`, and `players`. The `play
 | `round_scores` | `null` during play and review, then an object mapping player IDs to integer round totals. |
 | `review` | Present only for rounds with review candidates. Contains `deadline` in Unix milliseconds, `remaining_ms` until review closes (zero in results), and `entries` with `player_id`, `category`, trimmed `answer`, and `status`. Status is `pending`, `accepted`, `rejected`, or `timed_out`. During review only these candidates are exposed. |
 
-An invalid packet returns `invalid_message`. Admission can also return `invalid_code`, `room_not_found`, `room_full`, `room_started`, `invalid_session`, `duplicate_connection`, or `room_capacity`. Settings validation returns `invalid_settings`. Host and phase checks can return `host_only`, `room_started`, or `players_required`. Round and match actions can return `round_inactive`, `stale_round`, `invalid_draft`, `results_required`, or `endless_only`.
+A malformed envelope or unsupported command returns `invalid_message`. Admission can also return `invalid_code`, `room_not_found`, `room_full`, `room_started`, `invalid_session`, `duplicate_connection`, or `room_capacity`. Settings validation returns `invalid_settings`. Host and phase checks can return `host_only`, `room_started`, or `players_required`. Round and match actions can return `round_inactive`, `stale_round`, `invalid_draft`, `results_required`, or `endless_only`.
 
 After admission, each connection uses a FIFO queue of up to 32 outgoing messages and separate reader and writer tasks. The reader yields between buffered messages so deadlines and other connections can run. Each send has a five-second timeout. The server uses close code `1008` when admission limits are reached, `1013` when the send queue fills or a send times out, and `1011` for unexpected connection failures. Cleanup observes both tasks and releases only that socket's binding.
 
 Unexpected failures are logged as `internal_error` with a fixed operation name and exception class. Application logs omit raw messages, tokens, answers, exception text, and tracebacks. A deadline failure gets one delayed retry if the same live round remains in the relevant phase. Cleanup failures are contained so later sweeps can run.
+
+## Room chat
+
+Each `Room` owns a `RoomChat` for its entire lifetime. The chat buffer retains the newest 50 messages and drops the oldest when the limit is reached. Connection teardown keeps that buffer and the rate limit for each seat. Normal room expiration removes the chat with the room. A reused code identifies a new room with empty history. Restarting the process also clears all chat.
+
+After receiving its initial `state`, an admitted socket can request `chat_subscribe` once both seats are claimed. The server enqueues the history and registers the socket's subscription synchronously, so any concurrent message appears either in the snapshot or as a live message behind it in the same FIFO. A reconnecting seat subscribes on its new socket. Legacy sockets receive their usual game stream without chat broadcasts. The same rules apply in every room phase, including after match completion and when a claimed seat is offline.
+
+The browser subscribes once on each admitted socket as soon as its room snapshot shows both seats claimed. A history snapshot replaces the visible list. Live entries are ordered and deduplicated by sequence. The panel retains the visible history during a temporary connection loss and disables sending until the new socket receives history. It clears local chat on leaving or confirmed terminal session loss. The browser renders labels and text with DOM text nodes and uses a separate error element for chat.
+
+Each entry has `seq`, `player_id`, and `text`. Sequence numbers start at one and increase within a room. The server derives the sender and room from the live socket binding. Chat payloads exclude session tokens and chat is separate from room snapshots, game actions, and deadline handling.
+
+The existing bounded JSON parser runs before chat command validation. The server rejects line breaks, trims surrounding whitespace, and rejects empty text or more than 500 UTF-8 bytes. Chat errors use `invalid_chat` for the wrong fields or invalid text, `chat_unavailable` while the second seat is unclaimed, `chat_not_subscribed` for sends before subscribing, and `chat_rate_limited` when the seat has exhausted its send allowance. Each seat can send up to three messages at once and regains one send every two seconds. Repeated rate limit errors produce at most one reply per seat every two seconds. Admission and parser errors use the existing `error` message. Application logs omit chat content and credentials.
 
 ## Verification
 

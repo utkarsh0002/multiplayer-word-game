@@ -40,6 +40,11 @@
         </form>
 
         <p id="home-error" class="error" role="alert" hidden></p>
+        <p id="home-seat-status" role="status" hidden></p>
+        <div class="actions">
+          <button id="retry-seat-home" type="button" hidden>Retry connection</button>
+          <button id="leave-saved-room" type="button" hidden>Leave room</button>
+        </div>
         <div class="connection" id="home-connection">
           <p id="connection-status" class="connection-status" role="status" data-state="checking">
             Checking server&hellip;
@@ -131,7 +136,8 @@
             <button id="start-game" class="primary" type="button" hidden>Start</button>
             <button id="ready-next-round" class="primary" type="button" hidden>Ready</button>
             <button id="end-match" type="button" hidden>End Match</button>
-            <button id="return-home" type="button" hidden>Return home</button>
+            <button id="retry-seat-room" type="button" hidden>Retry connection</button>
+            <button id="return-home" type="button" hidden>Leave room</button>
           </div>
           <p id="lobby-error" class="error" role="alert" hidden></p>
         </div>
@@ -152,6 +158,23 @@
             </form>
           </details>
         </div>
+
+        <section class="panel lobby-panel room-chat" id="room-chat" aria-labelledby="chat-title">
+          <h2 id="chat-title">Room chat</h2>
+          <p class="chat-status" id="chat-status" role="status">Waiting for the other player to join.</p>
+          <div class="chat-log" role="log" aria-labelledby="chat-title" aria-relevant="additions">
+            <p class="chat-empty" id="chat-empty">No messages yet.</p>
+            <ol class="chat-history" id="chat-history" aria-label="Message history" tabindex="0"></ol>
+          </div>
+          <form class="chat-form" id="chat-form">
+            <label for="chat-input">Message</label>
+            <div class="chat-compose">
+              <input id="chat-input" type="text" autocomplete="off" enterkeyhint="send" aria-describedby="chat-error" required disabled>
+              <button class="primary" id="chat-send" type="submit" disabled>Send</button>
+            </div>
+          </form>
+          <p class="error chat-error" id="chat-error" role="alert" hidden></p>
+        </section>
       </div>
     </section>
 

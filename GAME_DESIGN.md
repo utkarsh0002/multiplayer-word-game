@@ -2,11 +2,11 @@
 
 Word Rally is a real-time word game for two people playing in desktop or mobile browsers. Both players receive the same starting letter and race to enter one word for each selected category. Either player can end the round early with **Done**. The full game uses category-based scoring and can run for a fixed number of rounds or continue in Endless mode.
 
-The MVP is designed for players on separate devices that can reach the same server. The current setup runs locally. The game uses shareable room codes and private session tokens. Accounts, chat, matchmaking, and a database are outside the MVP scope.
+The MVP is designed for players on separate devices that can reach the same server. The current setup runs locally. The game uses shareable room codes and private session tokens. Accounts, matchmaking, and a database are outside the MVP scope.
 
 ## Implementation status
 
-| Feature | Status after Milestone 6A.1 |
+| Feature | Status |
 | --- | --- |
 | Home, room creation and joining, lobby, and synchronized settings | Implemented |
 | Two-player capacity, host controls, connection indicators, and session resume | Implemented |
@@ -16,6 +16,7 @@ The MVP is designed for players on separate devices that can reach the same serv
 | Ready, additional rounds, mode-specific match endings, and final results | Implemented |
 | Backend message, session, cleanup, and concurrency hardening | Implemented in Milestone 6A |
 | Optional Community Word Approval | Implemented in Milestone 6A.1 |
+| Persistent in-room chat | Implemented in Milestone 6A.2. |
 | Frontend reliability, mobile and desktop layout, and error-state review | Pending in Milestone 6B |
 
 See [PROGRESS.md](PROGRESS.md) for milestone status and [ARCHITECTURE.md](ARCHITECTURE.md) for the current protocol.
@@ -35,6 +36,12 @@ See [PROGRESS.md](PROGRESS.md) for milestone status and [ARCHITECTURE.md](ARCHIT
 | Game mode | Fixed rounds or Endless. Default is Fixed rounds. |
 | Round count | 1–20 whole rounds for Fixed rounds. Default is 5. Endless has no round count. |
 | Community Word Approval | The host can enable peer review of eligible answers absent from the chosen category's word list. Off by default. |
+
+## In-room chat
+
+After both seats are claimed, either connected player can use chat from the lobby through final results, even when the other player is offline. Chat is private to the admitted seats and has no effect on drafts, timers, scoring, or Ready. The server retains the latest 50 messages in memory for the life of the room. A player who resumes their seat can subscribe again and recover the retained messages. Room expiration or a server restart clears the history.
+
+Messages must be single-line text and may contain up to 500 UTF-8 bytes after trimming. Each seat can send an initial burst of three messages and regains one send every two seconds, up to the burst limit. Reconnecting retains the seat's rate limit. The room chat panel stays available through every phase. Press Enter or choose **Send** to post a message. Shift+Enter leaves the draft as it is.
 
 ## Round flow
 

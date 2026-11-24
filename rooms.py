@@ -5,6 +5,7 @@ from hashlib import sha256
 from time import monotonic
 from uuid import uuid4
 
+from chat import RoomChat
 from rounds import Round
 from word_lists import WORD_LISTS
 
@@ -91,6 +92,7 @@ class Room:
     empty_since: float | None = None
     round: Round | None = None
     ready_players: set[str] = field(default_factory=set)
+    chat: RoomChat = field(default_factory=RoomChat, repr=False, compare=False)
 
     @property
     def host(self) -> Player:

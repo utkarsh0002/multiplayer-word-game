@@ -33,24 +33,29 @@ On macOS or Linux, use `./.venv/bin/python` in place of `.\.venv\Scripts\python.
 2. Submit an answer that fits the category and starts with the shared letter but is absent from its [built-in list](word_lists.py). Both windows enter review after the round. The opposing player sees **Accept** and **Reject** for that answer.
 3. Decide before the shared 15-second timer expires. Eligible answers without a decision are automatically rejected. When the review ends, both windows show the final decisions and scores. The timer continues if one player disconnects or reloads.
 
+### In-room chat
+
+Use **Room chat** once both seats are claimed. Type a single-line message and press Enter or choose **Send**. The panel stays available through final results. If the other player disconnects, you can continue sending messages. Reloading a tab and resuming its seat restores the latest 50 messages, including any sent while it was away.
+
 ## Run the checks
 
 ```powershell
 .\.venv\Scripts\python.exe -B -m unittest discover -s tests -v
+node --test tests/reconnect.test.cjs
 node --check static/app.js
 ```
 
-The tests include local Uvicorn servers and real WebSocket connections. They cover lobby behavior, private drafts, Done and timeout, validation and scoring, Ready, multiple rounds, and match completion. Hardening tests also exercise malformed messages, unauthorized access, room expiration, simultaneous actions, and recovery from internal failures.
+The tests include local Uvicorn servers and real WebSocket connections. They cover lobby behavior, private drafts, Done and timeout, validation and scoring, Ready, multiple rounds, and match completion. Hardening tests also exercise malformed messages, unauthorized access, room expiration, simultaneous actions, and recovery from internal failures. The frontend tests use the built-in Node test runner to cover saved-seat recovery, retry limits, overlapping connection attempts, and chat history and controls.
 
 ## How the server runs a match
 
 - `main.py` serves the home page, health check, and `/ws` endpoint. The `websockets` dependency lets Uvicorn accept WebSocket connections.
 - `rooms.py` owns in-memory room state and phase transitions. From `results`, both players must be ready and connected to start the next round. A Fixed match reaches `finished` as soon as the last round is scored. An Endless match reaches `finished` when either player ends it from `results`. Transitions run without an `await` on one event loop, so competing requests cannot submit a round or start its successor twice.
 - `rounds.py` tracks the round and freezes a trimmed, case-preserving copy of the drafts on submission. `review.py` handles eligible unlisted candidates when approval is enabled. `scoring.py` uses the assigned letter, built-in word lists, and any final review decisions. The room adds each player's round score to their match total once.
-- `lobby.py` associates each WebSocket with its server-assigned player and schedules one timer for the timed phase. It checks deadlines before accepting actions. Resume restores only the returning player's active drafts and the current shared review state. Deadlines keep running through disconnects.
+- `lobby.py` associates each WebSocket with its server-assigned player and schedules one timer for the timed phase. It checks deadlines before applying game commands. Resume restores only the returning player's active drafts and the current shared review state. Deadlines keep running through disconnects.
 - `static/app.js` sends drafts as the player types. Its countdowns display the server's remaining time. The browser renders review decisions, Ready choices, scores, and the final outcome from the shared server state.
 
-Rooms and sessions are lost when the backend process restarts, including during a code reload. Run a single backend process. A disconnected player's seat stays reserved with its score and current Ready choice. The active timer continues, and between-round progression waits for both seats to reconnect. A room is eligible for cleanup after every player has been disconnected for ten minutes.
+Rooms, sessions, and chat histories are lost when the backend process restarts, including during a code reload. Run a single backend process. A disconnected player's seat stays reserved with its score and current Ready choice. The active timer continues, and between-round progression waits for both seats to reconnect. A room is eligible for cleanup after every player has been disconnected for ten minutes.
 
 The built-in word lists are starter data. With Community Word Approval off, an answer is invalid if its exact normalized spelling is absent from the category list. With it on, a well-formed unlisted word or phrase with the correct starting letter can earn points if the opponent accepts it. Decisions apply only to the current round.
 
@@ -63,7 +68,7 @@ The built-in word lists are starter data. With Community Word Approval off, an a
 
 ## WebSocket protocol
 
-Messages are JSON objects with a `type`. Clients identify themselves before sending lobby, round, or match actions.
+Messages are JSON objects with a `type`. Clients identify themselves before sending lobby, round, match, or chat commands.
 
 | Direction | Type | Fields and behavior |
 | --- | --- | --- |
@@ -77,11 +82,16 @@ Messages are JSON objects with a `type`. Clients identify themselves before send
 | Client → server | `review_answer` | `round_number`, candidate owner's `player_id`, `category`, and `decision` (`accept` or `reject`). Only the opponent can decide a candidate. |
 | Client → server | `ready` | `round_number`. Marks the caller ready on the current between-round results. |
 | Client → server | `end_match` | `round_number`. Either player can finish an Endless match from the current between-round results. |
+| Client → server | `chat_subscribe` | No other fields. Subscribe after the initial `state`, once both seats are claimed. |
+| Client → server | `chat_send` | `text`. Send a single-line message of up to 500 UTF-8 bytes after trimming. Requires a subscription. |
 | Server → client | `session` | `code`, `player_id`, and `token`. Sent to the identifying connection. |
 | Server → client | `state` | `room` with `code`, `phase`, `settings`, and `players`. Each player has `id`, `label`, `host`, and `connected`. A room that has started also has `round`. |
 | Server → client | `drafts` | `round_number` and the returning player's `answers`. Private, sent after `session` and before the first active `state` on resume. |
 | Server → client | `draft_saved` | `round_number` and `category`. Sent only to the player whose draft was accepted. |
 | Server → client | `error` | `code` and a readable `message`. Sent to the requesting client. |
+| Server → client | `chat_history` | `messages`. One ordered snapshot on subscription, including an empty array when there is no history. |
+| Server → client | `chat_message` | `message`. One accepted entry with `seq`, `player_id`, and `text`. Sent only to subscribed seats in the room. |
+| Server → client | `chat_error` | `code` and a safe, readable `message`. Sent to the requesting client. |
 
 Settings contain `categories` (one or more of `animals`, `countries`, `food`, `sports`, `cities`), `duration` (15–180 seconds), `mode` (`fixed` or `endless`), and `rounds` (1–20 for fixed, `null` for endless). Optional `community_word_approval` defaults to `false`. Room codes use six uppercase letters or digits selected from an alphabet that omits easily confused characters. The server also accepts lowercase codes.
 

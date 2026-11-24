@@ -8,10 +8,21 @@ const settingsTemplate = document.querySelector("#settings-template");
 const statusMessage = document.querySelector("#connection-status");
 const retryButton = document.querySelector("#retry");
 const homeError = document.querySelector("#home-error");
+const homeSeatStatus = document.querySelector("#home-seat-status");
+const retrySeatHome = document.querySelector("#retry-seat-home");
+const leaveSavedRoom = document.querySelector("#leave-saved-room");
 const lobby = document.querySelector("#lobby");
 const lobbyTitle = document.querySelector("#lobby-title");
 const lobbyConnection = document.querySelector("#lobby-connection");
 const lobbyError = document.querySelector("#lobby-error");
+const chatPanel = document.querySelector("#room-chat");
+const chatHistory = document.querySelector("#chat-history");
+const chatEmpty = document.querySelector("#chat-empty");
+const chatStatus = document.querySelector("#chat-status");
+const chatError = document.querySelector("#chat-error");
+const chatForm = document.querySelector("#chat-form");
+const chatInput = document.querySelector("#chat-input");
+const chatSend = document.querySelector("#chat-send");
 const roomCode = document.querySelector("#room-code");
 const copyStatus = document.querySelector("#copy-status");
 const playerList = document.querySelector("#players");
@@ -21,6 +32,7 @@ const readyButton = document.querySelector("#ready-next-round");
 const endMatchButton = document.querySelector("#end-match");
 const endMatchDialog = document.querySelector("#confirm-end-match");
 const returnHomeButton = document.querySelector("#return-home");
+const retrySeatRoom = document.querySelector("#retry-seat-room");
 const hostSettings = document.querySelector("#host-settings");
 const lobbySettings = document.querySelector("#lobby-settings");
 const roundPanel = document.querySelector("#round-panel");
@@ -55,6 +67,10 @@ for (const field of settingsTemplate.content.querySelectorAll("input[name=catego
 }
 
 const sessionKey = "word-rally-room";
+const reconnectDelays = [1200, 2400, 4800];
+const chatByteLimit = 500;
+const chatHistoryLimit = 50;
+const chatEncoder = new TextEncoder();
 let session = savedSession();
 let socket = null;
 let room = null;
@@ -62,11 +78,15 @@ let joining = false;
 let connected = false;
 let pendingAction = null;
 let reconnectTimer = null;
-let retriedDuplicate = false;
+let reconnectAttempt = 0;
+let closingIntentionally = false;
+let suspended = false;
 let confirmedSettings = null;
 let restoredDrafts = null;
 let countdownInterval = null;
 let countdownDeadline = 0;
+let chatMessages = [];
+let chatReady = false;
 
 async function checkServer() {
   retryButton.hidden = true;
@@ -428,10 +448,88 @@ function showRound(previousRoom) {
   restoredDrafts = null;
 }
 
-function updateControls() {
-  for (const control of home.querySelectorAll(".primary, #show-join, [data-home]")) {
-    control.disabled = joining;
+function canSendChat() {
+  return chatReady && connected && socket?.readyState === WebSocket.OPEN;
+}
+
+function updateChatControls() {
+  const enabled = canSendChat();
+  chatInput.disabled = !enabled;
+  chatSend.disabled = !enabled;
+
+  const opponent = room?.players.find((player) => player.id !== session?.player_id);
+  let status = "";
+  if (room && !connected) {
+    status = "Reconnect to send a message.";
+  } else if (room && !opponent) {
+    status = "Chat opens when the second player joins.";
+  } else if (room && !chatReady) {
+    status = "Loading chat history…";
+  } else if (opponent && !opponent.connected) {
+    status = opponent.label + " is disconnected. They can read messages when they return.";
   }
+  if (chatStatus.textContent !== status) chatStatus.textContent = status;
+  chatStatus.hidden = !status;
+}
+
+function createChatRow(message) {
+  const row = document.createElement("li");
+  const author = document.createElement("strong");
+  const text = document.createElement("span");
+  author.textContent = room.players.find((player) => player.id === message.player_id)?.label ?? "Player";
+  text.textContent = message.text;
+  row.append(author, text);
+  return row;
+}
+
+function updateChatEmptyState() {
+  chatEmpty.hidden = chatMessages.length > 0;
+  chatHistory.hidden = chatMessages.length === 0;
+}
+
+function replaceChatHistory(messages) {
+  const unique = new Map(messages.map((message) => [message.seq, message]));
+  chatMessages = [...unique.values()].sort((first, second) => first.seq - second.seq).slice(-chatHistoryLimit);
+  chatHistory.replaceChildren(...chatMessages.map(createChatRow));
+  updateChatEmptyState();
+  chatHistory.scrollTop = chatHistory.scrollHeight;
+}
+
+function addChatMessage(message) {
+  const next = chatMessages.findIndex((entry) => entry.seq >= message.seq);
+  const index = next < 0 ? chatMessages.length : next;
+  if (chatMessages[index]?.seq === message.seq || (index === 0 && chatMessages.length === chatHistoryLimit)) return;
+
+  const followLatest = chatHistory.scrollHeight - chatHistory.scrollTop - chatHistory.clientHeight <= 8;
+  chatMessages.splice(index, 0, message);
+  chatHistory.insertBefore(createChatRow(message), chatHistory.children[index] ?? null);
+  if (chatMessages.length > chatHistoryLimit) {
+    chatMessages.shift();
+    chatHistory.firstElementChild.remove();
+  }
+  updateChatEmptyState();
+  if (followLatest) chatHistory.scrollTop = chatHistory.scrollHeight;
+}
+
+function clearChat() {
+  chatReady = false;
+  replaceChatHistory([]);
+  chatInput.value = "";
+  setError(chatError);
+}
+
+function updateControls() {
+  updateChatControls();
+  const recoveringSeat = Boolean(session) && !connected;
+  const retryAvailable = recoveringSeat && !socket && reconnectTimer === null;
+  for (const control of home.querySelectorAll(".primary, #show-join, [data-home]")) {
+    control.disabled = Boolean(socket) || recoveringSeat;
+  }
+  homeSeatStatus.hidden = !recoveringSeat;
+  homeSeatStatus.textContent = retryAvailable ? "Connection paused. Retry to reclaim your seat." : "Reconnecting to your room…";
+  retrySeatHome.hidden = !retryAvailable;
+  retrySeatRoom.hidden = !retryAvailable;
+  leaveSavedRoom.hidden = !recoveringSeat;
   if (!room) return;
 
   const isHost = room.players.some((player) => player.id === session?.player_id && player.host);
@@ -444,7 +542,13 @@ function updateControls() {
   const canEndMatch = inResults && room.settings.mode === "endless";
   const canAnswer = room.phase === "active" && connected && !pendingAction;
   lobbyConnection.dataset.state = connected ? "online" : "unavailable";
-  lobbyConnection.textContent = connected ? (inLobby ? "Lobby connected" : "Room connected") : session ? "Reconnecting…" : "Connection lost";
+  if (connected) {
+    lobbyConnection.textContent = inLobby ? "Lobby connected" : "Room connected";
+  } else if (recoveringSeat) {
+    lobbyConnection.textContent = retryAvailable ? "Connection paused" : "Reconnecting…";
+  } else {
+    lobbyConnection.textContent = "Connection lost";
+  }
   startButton.hidden = !isHost || !inLobby;
   startButton.disabled = !connected || !bothConnected || Boolean(pendingAction);
   readyButton.hidden = !inResults;
@@ -513,13 +617,15 @@ function showRoom(state) {
   updateControls();
   home.hidden = true;
   lobby.hidden = false;
-  if (opening || previousRoom?.phase !== room.phase) lobbyTitle.focus();
+  if (opening || (previousRoom?.phase !== room.phase && !chatPanel.contains(document.activeElement))) {
+    lobbyTitle.focus();
+  }
 }
 
 function stopSocket() {
-  const previous = socket;
-  socket = null;
-  if (previous) previous.close();
+  if (!socket) return;
+  closingIntentionally = true;
+  socket.close();
 }
 
 function resumeSession() {
@@ -527,15 +633,24 @@ function resumeSession() {
 }
 
 function reconnect() {
-  clearTimeout(reconnectTimer);
-  reconnectTimer = setTimeout(resumeSession, 1200);
+  const delay = reconnectDelays[reconnectAttempt];
+  if (!session || suspended || socket || reconnectTimer !== null || delay === undefined) return false;
+  reconnectAttempt += 1;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    resumeSession();
+  }, delay);
+  return true;
 }
 
 function connect(request) {
-  clearTimeout(reconnectTimer);
-  stopSocket();
+  if (suspended || socket || reconnectTimer !== null || (session && request.type !== "resume")) return;
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   const connection = new WebSocket(`${protocol}//${window.location.host}/ws`);
+  let admissionError = null;
+  let receivedSession = false;
+  let chatSubscriptionRequested = false;
+  chatReady = false;
   socket = connection;
   joining = true;
   connected = false;
@@ -547,33 +662,40 @@ function connect(request) {
 
   const handshakeTimeout = setTimeout(() => connection.close(), 8000);
   connection.addEventListener("open", () => {
-    if (socket === connection) connection.send(JSON.stringify(request));
+    if (socket === connection && !closingIntentionally) connection.send(JSON.stringify(request));
   });
   connection.addEventListener("message", (event) => {
-    if (socket !== connection) return;
+    if (socket !== connection || closingIntentionally || admissionError) return;
     const message = JSON.parse(event.data);
     if (message.type === "session") {
+      receivedSession = true;
       storeSession({ code: message.code, player_id: message.player_id, token: message.token });
     } else if (message.type === "drafts") {
       restoredDrafts = message;
     } else if (message.type === "state") {
       clearTimeout(handshakeTimeout);
-      retriedDuplicate = false;
+      reconnectAttempt = 0;
       if (pendingAction) setError(lobbyError);
       showRoom(message.room);
+      if (receivedSession && !chatSubscriptionRequested && room.players.length === 2) {
+        chatSubscriptionRequested = true;
+        connection.send(JSON.stringify({ type: "chat_subscribe" }));
+      }
+    } else if (message.type === "chat_history" && chatSubscriptionRequested) {
+      replaceChatHistory(message.messages);
+      chatReady = true;
+      updateChatControls();
+    } else if (message.type === "chat_message" && chatReady) {
+      addChatMessage(message.message);
+    } else if (message.type === "chat_error" && chatSubscriptionRequested) {
+      setError(chatError, message.message);
     } else if (message.type === "error") {
       if (joining) {
         clearTimeout(handshakeTimeout);
-        stopSocket();
-        joining = false;
-        if (request.type === "resume" && message.code === "duplicate_connection" && !retriedDuplicate) {
-          retriedDuplicate = true;
-          reconnect();
-          updateControls();
-          return;
-        }
-        storeSession(null);
-        updateControls();
+        admissionError = message;
+        // Keep ownership until close completes. A retry must never overlap a closing socket.
+        connection.close();
+        return;
       }
       pendingAction = null;
       setError(lobby.hidden ? homeError : lobbyError, message.message);
@@ -584,16 +706,35 @@ function connect(request) {
     clearTimeout(handshakeTimeout);
     if (socket !== connection) return;
     socket = null;
+    chatReady = false;
+    const intentional = closingIntentionally;
+    closingIntentionally = false;
     connected = false;
     joining = false;
     pendingAction = null;
+    if (suspended) return;
     if (room) showPlayers();
-    updateControls();
-    if (session) {
-      reconnect();
+    const errorElement = lobby.hidden ? homeError : lobbyError;
+    if (intentional) {
+      resumeSession();
+    } else if (admissionError) {
+      if (request.type === "resume" && ["invalid_session", "room_not_found"].includes(admissionError.code)) {
+        storeSession(null);
+        clearChat();
+      }
+      if (admissionError.code === "duplicate_connection" && request.type === "resume") {
+        if (!reconnect()) {
+          setError(errorElement, "Your seat is still connected. Retry after the other connection closes.");
+        }
+      } else {
+        setError(errorElement, admissionError.message);
+      }
+    } else if (session) {
+      if (!reconnect()) setError(errorElement, "Could not reconnect to your room. Try again when the connection is available.");
     } else {
       setError(homeError, "Could not connect to the lobby server. Try again.");
     }
+    updateControls();
   });
 }
 
@@ -641,6 +782,33 @@ settingsForm.addEventListener("submit", (event) => {
   const settings = readSettings(settingsForm, lobbyError);
   if (settings) sendAction({ type: "update_settings", settings });
 });
+chatInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && event.shiftKey) event.preventDefault();
+});
+chatInput.addEventListener("input", () => setError(chatError));
+chatForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (!canSendChat()) return;
+  const rawText = chatInput.value;
+  const text = rawText.trim();
+  if (!text || /[\u000a-\u000d\u001c-\u001e\u0085\u2028\u2029]/u.test(rawText)) {
+    setError(chatError, "Enter a nonblank message on one line.");
+    return;
+  }
+  // JSON would escape an unpaired surrogate, which the server's UTF-8 parser rejects.
+  if (/[\uD800-\uDFFF]/u.test(text)) {
+    setError(chatError, "Enter valid Unicode text.");
+    return;
+  }
+  if (chatEncoder.encode(text).length > chatByteLimit) {
+    setError(chatError, "Messages can contain up to " + chatByteLimit + " UTF-8 bytes.");
+    return;
+  }
+  socket.send(JSON.stringify({ type: "chat_send", text }));
+  chatInput.value = "";
+  setError(chatError);
+});
+
 startButton.addEventListener("click", () => sendAction({ type: "start" }));
 roundForm.addEventListener("input", (event) => {
   if (room?.phase !== "active" || !connected || pendingAction || socket?.readyState !== WebSocket.OPEN) return;
@@ -680,13 +848,15 @@ document.querySelector("#copy-code").addEventListener("click", async () => {
 
 function leaveRoom(entry = null) {
   clearTimeout(reconnectTimer);
+  reconnectTimer = null;
   stopSocket();
   storeSession(null);
+  clearChat();
   room = null;
   joining = false;
   connected = false;
   pendingAction = null;
-  retriedDuplicate = false;
+  reconnectAttempt = 0;
   restoredDrafts = null;
   confirmedSettings = null;
   copyStatus.textContent = "";
@@ -699,15 +869,34 @@ function leaveRoom(entry = null) {
 }
 
 returnHomeButton.addEventListener("click", () => leaveRoom());
+leaveSavedRoom.addEventListener("click", () => leaveRoom());
 document.querySelector("#create-new-room").addEventListener("click", () => leaveRoom(createForm));
 
+function retrySeat() {
+  if (!session || suspended || socket || reconnectTimer !== null) return;
+  reconnectAttempt = 0;
+  resumeSession();
+}
+
+retrySeatHome.addEventListener("click", retrySeat);
+retrySeatRoom.addEventListener("click", retrySeat);
+
 window.addEventListener("pagehide", () => {
+  suspended = true;
+  connected = false;
+  updateChatControls();
   clearTimeout(reconnectTimer);
+  reconnectTimer = null;
   stopCountdown();
   stopSocket();
 });
 window.addEventListener("pageshow", (event) => {
-  if (event.persisted) resumeSession();
+  if (event.persisted && suspended) {
+    suspended = false;
+    reconnectAttempt = 0;
+    resumeSession();
+    updateControls();
+  }
 });
 
 retryButton.addEventListener("click", checkServer);

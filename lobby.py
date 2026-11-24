@@ -5,6 +5,7 @@ import secrets
 from fastapi import WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
+from chat import ChatError
 from protocol import receive_message
 from rooms import Player, Room, RoomError, RoomStore, Settings
 from rounds import MAX_ANSWER_LENGTH, Round
@@ -35,6 +36,7 @@ class Client:
     def __init__(self) -> None:
         self.messages: asyncio.Queue[dict | None] = asyncio.Queue(maxsize=32)
         self.overloaded = False
+        self.chat_subscribed = False
 
     def send(self, message: dict) -> None:
         if self.overloaded:
@@ -198,14 +200,43 @@ class Lobby:
             raise RoomError("invalid_draft", f"Choose a round category and enter up to {MAX_ANSWER_LENGTH} characters.")
         client.send({"type": "draft_saved", "round_number": number, "category": category})
 
+    def apply_chat(self, client: Client, room: Room, player: Player, message: dict) -> None:
+        subscribing = message["type"] == "chat_subscribe"
+        expected_keys = {"type"} if subscribing else {"type", "text"}
+        if message.keys() != expected_keys:
+            raise ChatError("invalid_chat", "Send only the fields required for this chat action.")
+        if len(room.players) != 2:
+            raise ChatError("chat_unavailable", "Chat opens when both player seats have been claimed.")
+
+        if subscribing:
+            if not client.chat_subscribed:
+                # Queue the history and subscribe together before another command can publish.
+                client.send({"type": "chat_history", "messages": room.chat.history()})
+                client.chat_subscribed = True
+            return
+        if not client.chat_subscribed:
+            raise ChatError("chat_not_subscribed", "Subscribe to room chat before sending a message.")
+
+        entry = room.chat.publish(player.id, message["text"])
+        if entry is not None:
+            event = {"type": "chat_message", "message": entry}
+            for seat in room.players:
+                recipient = self.clients.get(seat.id)
+                if recipient is not None and recipient.chat_subscribed:
+                    recipient.send(event)
+
     async def read_commands(self, socket: WebSocket, client: Client, room: Room, player: Player) -> None:
         while True:
             try:
                 message = await receive_message(socket)
                 if self.clients.get(player.id) is not client or self.rooms.rooms.get(room.code) is not room:
                     return
-                expired_before_command = self.expire_deadline_if_due(room)
-                match message["type"]:
+                command = message["type"]
+                is_chat = command in ("chat_subscribe", "chat_send")
+                expired_before_command = not is_chat and self.expire_deadline_if_due(room)
+                match command:
+                    case "chat_subscribe" | "chat_send":
+                        self.apply_chat(client, room, player, message)
                     case "start" if message.keys() == {"type"}:
                         current_round = room.start(player)
                         self.schedule_deadline(room, current_round)
@@ -225,6 +256,8 @@ class Lobby:
                         raise RoomError("invalid_message", "That action is not supported.")
             except RoomError as error:
                 client.send(error_message(error))
+            except ChatError as error:
+                client.send({"type": "chat_error", "code": error.code, "message": str(error)})
             # A buffered receive can complete immediately. Give timers and other seats a turn.
             await asyncio.sleep(0)
 
