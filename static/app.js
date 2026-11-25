@@ -20,6 +20,7 @@ const chatHistory = document.querySelector("#chat-history");
 const chatEmpty = document.querySelector("#chat-empty");
 const chatStatus = document.querySelector("#chat-status");
 const chatError = document.querySelector("#chat-error");
+const chatDelivery = document.querySelector("#chat-delivery");
 const chatForm = document.querySelector("#chat-form");
 const chatInput = document.querySelector("#chat-input");
 const chatSend = document.querySelector("#chat-send");
@@ -41,6 +42,7 @@ const roundInputs = document.querySelector("#round-inputs");
 const doneButton = document.querySelector("#done-round");
 const reviewPanel = document.querySelector("#review-panel");
 const reviewOpponent = document.querySelector("#review-opponent");
+const reviewOpponentTitle = document.querySelector("#review-opponent-title");
 const reviewOwn = document.querySelector("#review-own");
 const reviewProgress = document.querySelector("#review-progress");
 const roundResults = document.querySelector("#round-results");
@@ -70,13 +72,16 @@ const sessionKey = "word-rally-room";
 const reconnectDelays = [1200, 2400, 4800];
 const chatByteLimit = 500;
 const chatHistoryLimit = 50;
+const chatConfirmationDelay = 5000;
+const chatRateLimitDelay = 2000;
 const chatEncoder = new TextEncoder();
 let session = savedSession();
 let socket = null;
 let room = null;
-let joining = false;
+let admissionAction = null;
 let connected = false;
 let pendingAction = null;
+let reviewVoteFocus = null;
 let reconnectTimer = null;
 let reconnectAttempt = 0;
 let closingIntentionally = false;
@@ -87,6 +92,11 @@ let countdownInterval = null;
 let countdownDeadline = 0;
 let chatMessages = [];
 let chatReady = false;
+let pendingChat = null;
+const chatAttempts = [];
+let lastChatConfirmationSequence = 0;
+let chatDraftVersion = 0;
+let chatRetryTimer = null;
 
 async function checkServer() {
   retryButton.hidden = true;
@@ -104,10 +114,10 @@ async function checkServer() {
     }
 
     statusMessage.dataset.state = "online";
-    statusMessage.textContent = "Server online";
+    statusMessage.textContent = "Last server check passed";
   } catch {
     statusMessage.dataset.state = "unavailable";
-    statusMessage.textContent = "Server unavailable";
+    statusMessage.textContent = "Last server check failed";
     retryButton.hidden = false;
   }
 }
@@ -441,7 +451,10 @@ function showRound(previousRoom) {
   }
   if (active || reviewing) {
     roundTimeLabel.textContent = reviewing ? "Review time remaining" : "Time remaining";
-    countdownDeadline = performance.now() + (reviewing ? round.review.remaining_ms : round.remaining_ms);
+    const snapshotDeadline = performance.now() + (reviewing ? round.review.remaining_ms : round.remaining_ms);
+    // A later snapshot can have spent longer in transit than an earlier one.
+    const sameTimedPhase = !newRound && previousRoom.phase === room.phase;
+    countdownDeadline = sameTimedPhase ? Math.min(countdownDeadline, snapshotDeadline) : snapshotDeadline;
     updateCountdown();
     if (countdownInterval === null) countdownInterval = setInterval(updateCountdown, 100);
   }
@@ -449,13 +462,14 @@ function showRound(previousRoom) {
 }
 
 function canSendChat() {
-  return chatReady && connected && socket?.readyState === WebSocket.OPEN;
+  return chatReady && connected && socket?.readyState === WebSocket.OPEN &&
+    pendingChat === null && chatRetryTimer === null;
 }
 
 function updateChatControls() {
-  const enabled = canSendChat();
-  chatInput.disabled = !enabled;
-  chatSend.disabled = !enabled;
+  chatInput.disabled = !(chatReady && connected && socket?.readyState === WebSocket.OPEN);
+  chatInput.readOnly = pendingChat !== null;
+  chatSend.disabled = !canSendChat();
 
   const opponent = room?.players.find((player) => player.id !== session?.player_id);
   let status = "";
@@ -498,7 +512,7 @@ function replaceChatHistory(messages) {
 function addChatMessage(message) {
   const next = chatMessages.findIndex((entry) => entry.seq >= message.seq);
   const index = next < 0 ? chatMessages.length : next;
-  if (chatMessages[index]?.seq === message.seq || (index === 0 && chatMessages.length === chatHistoryLimit)) return;
+  if (chatMessages[index]?.seq === message.seq || (index === 0 && chatMessages.length === chatHistoryLimit)) return false;
 
   const followLatest = chatHistory.scrollHeight - chatHistory.scrollTop - chatHistory.clientHeight <= 8;
   chatMessages.splice(index, 0, message);
@@ -509,9 +523,70 @@ function addChatMessage(message) {
   }
   updateChatEmptyState();
   if (followLatest) chatHistory.scrollTop = chatHistory.scrollHeight;
+  return true;
+}
+
+function finishChatSend(status = "") {
+  if (pendingChat) clearTimeout(pendingChat.timeout);
+  pendingChat = null;
+  setError(chatDelivery, status);
+}
+
+function showUnconfirmedChatDelivery() {
+  finishChatSend("Delivery unconfirmed. Check the chat before sending again.");
+  updateChatControls();
+}
+
+function normalizeChatText(text) {
+  // Python str.strip() uses Unicode whitespace plus U+001C through U+001F.
+  return text.replace(/^[\p{White_Space}\u001c-\u001f]+|[\p{White_Space}\u001c-\u001f]+$/gu, "");
+}
+
+function confirmChatMessage(message) {
+  if (message.player_id !== session?.player_id || message.seq <= lastChatConfirmationSequence) return false;
+  const index = chatAttempts.findIndex((attempt) =>
+    message.seq > attempt.previousSequence && message.text === attempt.text);
+  if (index === -1) return false;
+
+  const attempt = chatAttempts[index];
+  const latest = index === chatAttempts.length - 1;
+  lastChatConfirmationSequence = message.seq;
+  // Responses are ordered. For identical text, the first possible attempt gets the echo.
+  chatAttempts.splice(0, index + 1);
+  if (!latest) return false;
+
+  if (attempt.draftVersion === chatDraftVersion && normalizeChatText(chatInput.value) === attempt.text) {
+    chatInput.value = "";
+    setError(chatError);
+  }
+  finishChatSend();
+  return true;
+}
+
+function showChatError(message) {
+  const ambiguous = chatReady && chatAttempts.length > 1;
+  if (chatReady && chatAttempts.length > 0) {
+    // A later reply must belong to a later send, even if this rejection's exact attempt is unknown.
+    chatAttempts.shift();
+    if (!ambiguous) finishChatSend();
+  }
+  if (message.code === "chat_rate_limited") {
+    clearTimeout(chatRetryTimer);
+    chatRetryTimer = setTimeout(() => {
+      chatRetryTimer = null;
+      updateChatControls();
+    }, chatRateLimitDelay);
+  }
+  setError(chatError, ambiguous ? "A chat send was rejected. " + message.message : message.message);
+  updateChatControls();
 }
 
 function clearChat() {
+  finishChatSend();
+  chatAttempts.length = 0;
+  lastChatConfirmationSequence = 0;
+  clearTimeout(chatRetryTimer);
+  chatRetryTimer = null;
   chatReady = false;
   replaceChatHistory([]);
   chatInput.value = "";
@@ -525,8 +600,13 @@ function updateControls() {
   for (const control of home.querySelectorAll(".primary, #show-join, [data-home]")) {
     control.disabled = Boolean(socket) || recoveringSeat;
   }
-  homeSeatStatus.hidden = !recoveringSeat;
-  homeSeatStatus.textContent = retryAvailable ? "Connection paused. Retry to reclaim your seat." : "Reconnecting to your room…";
+  let admissionStatus = "";
+  if (admissionAction === "create") admissionStatus = "Creating room…";
+  else if (admissionAction === "join") admissionStatus = "Joining room…";
+  else if (recoveringSeat) {
+    admissionStatus = retryAvailable ? "Connection paused. Retry to reclaim your seat." : "Reconnecting to your room…";
+  }
+  setError(homeSeatStatus, admissionStatus);
   retrySeatHome.hidden = !retryAvailable;
   retrySeatRoom.hidden = !retryAvailable;
   leaveSavedRoom.hidden = !recoveringSeat;
@@ -541,7 +621,7 @@ function updateControls() {
   const ownReady = inResults && room.ready[session?.player_id];
   const canEndMatch = inResults && room.settings.mode === "endless";
   const canAnswer = room.phase === "active" && connected && !pendingAction;
-  lobbyConnection.dataset.state = connected ? "online" : "unavailable";
+  lobbyConnection.dataset.state = connected ? "online" : recoveringSeat && !retryAvailable ? "checking" : "unavailable";
   if (connected) {
     lobbyConnection.textContent = inLobby ? "Lobby connected" : "Room connected";
   } else if (recoveringSeat) {
@@ -568,7 +648,13 @@ function updateControls() {
 
   if (inLobby) {
     lobbyTitle.textContent = "Room lobby";
-    if (!bothConnected) {
+    if (!connected) {
+      roomStatus.textContent = "Reconnect to continue.";
+    } else if (pendingAction?.type === "start") {
+      roomStatus.textContent = "Starting the round…";
+    } else if (pendingAction?.type === "update_settings") {
+      roomStatus.textContent = "Saving settings…";
+    } else if (!bothConnected) {
       roomStatus.textContent = room.players.length < 2 ? "Share the room code with a friend." : "Waiting for the other player to reconnect.";
     } else {
       roomStatus.textContent = isHost ? "Both players are ready to start." : "Waiting for the host to start.";
@@ -584,7 +670,9 @@ function updateControls() {
       lobbyTitle.textContent = inResults ? `${title} ended` : title;
     }
     const otherPlayer = room.players.find((player) => player.id !== session?.player_id);
-    if (!otherPlayer?.connected) {
+    if (!connected) {
+      roomStatus.textContent = "Reconnect to continue.";
+    } else if (!otherPlayer?.connected) {
       roomStatus.textContent = "The other player is disconnected.";
     } else {
       roomStatus.textContent = ownReady ? "Waiting for the other player to be ready." : "";
@@ -593,6 +681,17 @@ function updateControls() {
 }
 
 function keepPendingAction() {
+  if (pendingAction?.type === "start") return room.phase === "lobby";
+  if (pendingAction?.type === "update_settings" && room.phase === "lobby") {
+    const requested = pendingAction.settings;
+    const confirmed = room.settings;
+    const settingsMatch = requested.duration === confirmed.duration &&
+      requested.mode === confirmed.mode && requested.rounds === confirmed.rounds &&
+      Boolean(requested.community_word_approval) === Boolean(confirmed.community_word_approval) &&
+      requested.categories.length === confirmed.categories.length &&
+      requested.categories.every((category, index) => category === confirmed.categories[index]);
+    return !settingsMatch;
+  }
   if (pendingAction?.type === "done") return room.phase === "active";
   if (pendingAction?.type === "end_match") return room.phase === "results";
   if (pendingAction?.type === "ready") return room.phase === "results" && !room.ready[session?.player_id];
@@ -603,18 +702,44 @@ function keepPendingAction() {
   return false;
 }
 
+document.addEventListener("focusin", (event) => {
+  if (reviewVoteFocus && event.target !== document.body && !reviewOpponent.contains(event.target)) {
+    reviewVoteFocus = null;
+  }
+});
+
+function restoreReviewVoteFocus() {
+  if (!reviewVoteFocus || !connected) return;
+  const vote = reviewVoteFocus;
+  if (room.code !== vote.roomCode || room.phase !== "review" || room.round.number !== vote.roundNumber) {
+    reviewVoteFocus = null;
+    return;
+  }
+  if (pendingAction?.type === "review_answer") return;
+  reviewVoteFocus = null;
+
+  const focused = document.activeElement;
+  if (focused && focused !== document.body && !reviewOpponent.contains(focused)) return;
+
+  const buttons = Array.from(reviewOpponent.querySelectorAll("button")).filter((button) => !button.disabled);
+  const sameButton = buttons.find((button) => button.dataset.decision === vote.decision &&
+    button.closest(".review-entry")?.dataset.category === vote.category);
+  (sameButton ?? buttons[0] ?? reviewOpponentTitle).focus();
+}
+
 function showRoom(state) {
   const opening = lobby.hidden;
   const previousRoom = room;
   room = state;
   connected = true;
-  joining = false;
+  admissionAction = null;
   if (!keepPendingAction()) pendingAction = null;
   roomCode.value = room.code;
   showPlayers();
   showSettings(room.settings);
   showRound(previousRoom);
   updateControls();
+  restoreReviewVoteFocus();
   home.hidden = true;
   lobby.hidden = false;
   if (opening || (previousRoom?.phase !== room.phase && !chatPanel.contains(document.activeElement))) {
@@ -652,7 +777,7 @@ function connect(request) {
   let chatSubscriptionRequested = false;
   chatReady = false;
   socket = connection;
-  joining = true;
+  admissionAction = request.type;
   connected = false;
   pendingAction = null;
   restoredDrafts = null;
@@ -681,16 +806,19 @@ function connect(request) {
         chatSubscriptionRequested = true;
         connection.send(JSON.stringify({ type: "chat_subscribe" }));
       }
-    } else if (message.type === "chat_history" && chatSubscriptionRequested) {
+    } else if (message.type === "chat_history" && chatSubscriptionRequested && !chatReady) {
       replaceChatHistory(message.messages);
+      for (const entry of chatMessages) confirmChatMessage(entry);
+      // The old socket is closed. Unmatched attempts can no longer receive a response.
+      chatAttempts.length = 0;
       chatReady = true;
       updateChatControls();
     } else if (message.type === "chat_message" && chatReady) {
-      addChatMessage(message.message);
+      if (addChatMessage(message.message) && confirmChatMessage(message.message)) updateChatControls();
     } else if (message.type === "chat_error" && chatSubscriptionRequested) {
-      setError(chatError, message.message);
+      showChatError(message);
     } else if (message.type === "error") {
-      if (joining) {
+      if (admissionAction) {
         clearTimeout(handshakeTimeout);
         admissionError = message;
         // Keep ownership until close completes. A retry must never overlap a closing socket.
@@ -700,6 +828,7 @@ function connect(request) {
       pendingAction = null;
       setError(lobby.hidden ? homeError : lobbyError, message.message);
       updateControls();
+      restoreReviewVoteFocus();
     }
   });
   connection.addEventListener("close", () => {
@@ -710,8 +839,9 @@ function connect(request) {
     const intentional = closingIntentionally;
     closingIntentionally = false;
     connected = false;
-    joining = false;
+    admissionAction = null;
     pendingAction = null;
+    if (pendingChat) showUnconfirmedChatDelivery();
     if (suspended) return;
     if (room) showPlayers();
     const errorElement = lobby.hidden ? homeError : lobbyError;
@@ -719,8 +849,9 @@ function connect(request) {
       resumeSession();
     } else if (admissionError) {
       if (request.type === "resume" && ["invalid_session", "room_not_found"].includes(admissionError.code)) {
-        storeSession(null);
-        clearChat();
+        leaveRoom();
+        setError(homeError, admissionError.message + " Create or join a room to continue.");
+        return;
       }
       if (admissionError.code === "duplicate_connection" && request.type === "resume") {
         if (!reconnect()) {
@@ -741,6 +872,12 @@ function connect(request) {
 function sendAction(message) {
   if (!connected || pendingAction || socket?.readyState !== WebSocket.OPEN) return;
   pendingAction = message;
+  if (message.type === "review_answer" && reviewOpponent.contains(document.activeElement)) {
+    // Disabling the vote button can blur it before the next snapshot arrives.
+    reviewVoteFocus = {
+      roomCode: room.code, roundNumber: message.round_number, category: message.category, decision: message.decision,
+    };
+  }
   setError(lobbyError);
   updateControls();
   socket.send(JSON.stringify(message));
@@ -769,13 +906,13 @@ for (const button of document.querySelectorAll("[data-home]")) {
 
 createForm.addEventListener("submit", (event) => {
   event.preventDefault();
-  if (joining) return;
+  if (admissionAction) return;
   const settings = readSettings(createForm, homeError);
   if (settings) connect({ type: "create", settings });
 });
 joinForm.addEventListener("submit", (event) => {
   event.preventDefault();
-  if (!joining) connect({ type: "join", code: joinCode.value.trim().toUpperCase() });
+  if (!admissionAction) connect({ type: "join", code: joinCode.value.trim().toUpperCase() });
 });
 settingsForm.addEventListener("submit", (event) => {
   event.preventDefault();
@@ -785,12 +922,15 @@ settingsForm.addEventListener("submit", (event) => {
 chatInput.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && event.shiftKey) event.preventDefault();
 });
-chatInput.addEventListener("input", () => setError(chatError));
+chatInput.addEventListener("input", () => {
+  chatDraftVersion += 1;
+  if (chatRetryTimer === null) setError(chatError);
+});
 chatForm.addEventListener("submit", (event) => {
   event.preventDefault();
   if (!canSendChat()) return;
   const rawText = chatInput.value;
-  const text = rawText.trim();
+  const text = normalizeChatText(rawText);
   if (!text || /[\u000a-\u000d\u001c-\u001e\u0085\u2028\u2029]/u.test(rawText)) {
     setError(chatError, "Enter a nonblank message on one line.");
     return;
@@ -804,9 +944,18 @@ chatForm.addEventListener("submit", (event) => {
     setError(chatError, "Messages can contain up to " + chatByteLimit + " UTF-8 bytes.");
     return;
   }
-  socket.send(JSON.stringify({ type: "chat_send", text }));
-  chatInput.value = "";
+  pendingChat = {
+    text,
+    previousSequence: chatMessages.at(-1)?.seq ?? 0,
+    draftVersion: chatDraftVersion,
+    // The server can suppress a repeated rate-limit error.
+    timeout: setTimeout(showUnconfirmedChatDelivery, chatConfirmationDelay),
+  };
+  chatAttempts.push(pendingChat);
   setError(chatError);
+  setError(chatDelivery, "Sending…");
+  updateChatControls();
+  socket.send(JSON.stringify({ type: "chat_send", text }));
 });
 
 startButton.addEventListener("click", () => sendAction({ type: "start" }));
@@ -853,9 +1002,10 @@ function leaveRoom(entry = null) {
   storeSession(null);
   clearChat();
   room = null;
-  joining = false;
+  admissionAction = null;
   connected = false;
   pendingAction = null;
+  reviewVoteFocus = null;
   reconnectAttempt = 0;
   restoredDrafts = null;
   confirmedSettings = null;

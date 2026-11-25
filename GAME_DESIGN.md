@@ -17,7 +17,7 @@ The MVP is designed for players on separate devices that can reach the same serv
 | Backend message, session, cleanup, and concurrency hardening | Implemented in Milestone 6A |
 | Optional Community Word Approval | Implemented in Milestone 6A.1 |
 | Persistent in-room chat | Implemented in Milestone 6A.2. |
-| Frontend reliability, mobile and desktop layout, and error-state review | Pending in Milestone 6B |
+| Frontend reliability and accessibility | Milestone 6B fixes cover lobby actions, countdowns, connection feedback, chat delivery, and review focus. |
 
 See [PROGRESS.md](PROGRESS.md) for milestone status and [ARCHITECTURE.md](ARCHITECTURE.md) for the current protocol.
 
@@ -41,14 +41,14 @@ See [PROGRESS.md](PROGRESS.md) for milestone status and [ARCHITECTURE.md](ARCHIT
 
 After both seats are claimed, either connected player can use chat from the lobby through final results, even when the other player is offline. Chat is private to the admitted seats and has no effect on drafts, timers, scoring, or Ready. The server retains the latest 50 messages in memory for the life of the room. A player who resumes their seat can subscribe again and recover the retained messages. Room expiration or a server restart clears the history.
 
-Messages must be single-line text and may contain up to 500 UTF-8 bytes after trimming. Each seat can send an initial burst of three messages and regains one send every two seconds, up to the burst limit. Reconnecting retains the seat's rate limit. The room chat panel stays available through every phase. Press Enter or choose **Send** to post a message. Shift+Enter leaves the draft as it is.
+Messages must be single-line text and may contain up to 500 UTF-8 bytes after trimming. Each seat can send an initial burst of three messages and regains one send every two seconds, up to the burst limit. Reconnecting retains the seat's rate limit. The room chat panel stays available through every phase. Press Enter or choose **Send** to post a message. Shift+Enter leaves the draft as it is. The composer keeps the message until the server confirms it. If sending fails or delivery is unclear, the text stays available for the player to review and send again.
 
 ## Round flow
 
 1. The host starts the first round. For every round the server selects a random letter from A–Z, uses the room’s configured categories, and sets a fresh start time and deadline from the configured duration. Both browsers receive the same round number, letter, categories, and deadline. Independent draws can produce the same letter in consecutive rounds.
 2. Each player sees the round number, letter, countdown, connection status, and one editable answer field per category. The objective is to enter a word beginning with the announced letter that belongs to the category. Players can leave any field blank or edit it during the active round. Draft updates go to the server for the sending player’s own seat, and only the server’s latest saved draft for each field is used at submission.
 3. Either player can click **Done** during the active round with any or all fields blank. The first valid Done the server accepts before the deadline ends the round for both players. The server freezes both players’ saved drafts, including those of the player who did not click Done. Late updates and repeated Done requests cannot alter the submission.
-4. If the deadline is reached first, the server submits the same saved drafts automatically, including while either player is disconnected. The browser countdown is informational. The server freezes submissions once, including when Done and timeout occur close together.
+4. If the deadline is reached first, the server submits the same saved drafts automatically, including while either player is disconnected. The browser countdown is informational. Delayed updates cannot add displayed time within the same round and phase. The server freezes submissions once, including when Done and timeout occur close together.
 5. If Community Word Approval is enabled and any answers are pending, both players enter a review phase before scoring. Otherwise, the server scores the round immediately.
 6. Both players receive the same scored results. The results show the round number, starting letter, ending reason, both players’ answers with a status and points per category, any review decisions, and each player's round and cumulative match totals. Submitted answers have leading and trailing whitespace trimmed and retain their original case for display. The final results also show the last scored round.
 

@@ -1,6 +1,6 @@
 # Word Rally progress
 
-**Milestone 6A.2 is complete.** Persistent in-room chat is available from the lobby through final results.
+**The five approved Milestone 6B frontend fixes are implemented.**
 
 For the complete game rules, see [GAME_DESIGN.md](GAME_DESIGN.md). For the current implementation and message protocol, see [ARCHITECTURE.md](ARCHITECTURE.md). Local setup and a two-window walkthrough are in [README.md](README.md).
 
@@ -16,14 +16,14 @@ For the complete game rules, see [GAME_DESIGN.md](GAME_DESIGN.md). For the curre
 | 6A · Backend hardening and reliability | Strict WebSocket JSON and admission limits, digested room credentials, socket-specific cleanup, bounded room capacity, identity-checked timers, and sanitized error handling. Regression tests exercise malformed input, privacy, disconnects, expiry, fault recovery, and competing actions. |
 | 6A.1 · Community Word Approval | Unlisted answers that pass eligibility checks enter an optional 15-second review. Players can decide only opponent entries. Pending decisions survive reconnects and time out on the server, and final decisions determine round scoring. The review and results screens display decisions. |
 | 6A.2 · Persistent in-room chat | The browser subscribes from the room and restores the server's latest 50 messages on reconnect. The chat panel stays visible across phases and while a seat is disconnected. |
+| 6B · Frontend hardening | Start and settings saves wait for the relevant server state. Round and review countdowns can only decrease within a timed phase. Connection and terminal-session feedback reflect the local socket. Chat preserves unconfirmed text. Keyboard focus moves to the next review control after a vote. |
 
 The suite covers lobby behavior, capacity, permissions, reconnects, cleanup, shared round metadata, draft isolation, early Done, autonomous timeout, validation, scoring, and match progression. Community Word Approval has regression coverage for eligibility, first-decision and opponent-only enforcement, timeouts, reconnects, concurrent decisions, and scoring. Run the full suite from the project root using the commands in [README.md](README.md).
 
-## Pending milestones
+## Follow-up verification
 
-| Milestone | Remaining work |
-| --- | --- |
-| 6B · Frontend hardening | Duplicate-session recovery now retains the saved seat. The remaining frontend reliability, accessibility, and layout items are pending. |
+- Measure how long a silently stalled connection can remain open under real packet loss before considering changes to transport recovery.
+- Check mobile sleep, back-forward cache behavior, and screen-reader phase announcements across browsers.
 
 ## Known limitations
 
@@ -32,4 +32,5 @@ The suite covers lobby behavior, capacity, permissions, reconnects, cleanup, sha
 - The app uses a single backend process and stores rooms, sessions, and chat in memory. Restarting or reloading the backend clears them.
 - A disconnect leaves the seat reserved for its token and the round timer keeps running. At between-round results, play waits for both seats to be ready and connected. A room becomes eligible for cleanup after ten minutes with every player disconnected. Browser recovery after a reload depends on the joining tab retaining its session token.
 - The browser retries the same seat after 1.2, 2.4, and 4.8 seconds. If those attempts fail, **Retry connection** is available and the token is retained. A stale or still-live connection must close before the server can admit the returning tab.
+- **Unresolved P1 admission issue.** If a first Join claims the guest seat and the socket closes before the browser receives `session`, the guest has no token to reclaim that seat. Retrying Join can return `room_full` while the host sees a disconnected guest. Creating a new room is the current workaround.
 - The local MVP caps rooms and per-socket admission work. It has no per-IP rate limits or public hosting configuration.

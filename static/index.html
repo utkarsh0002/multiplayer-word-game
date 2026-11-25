@@ -169,10 +169,11 @@
           <form class="chat-form" id="chat-form">
             <label for="chat-input">Message</label>
             <div class="chat-compose">
-              <input id="chat-input" type="text" autocomplete="off" enterkeyhint="send" aria-describedby="chat-error" required disabled>
+              <input id="chat-input" type="text" autocomplete="off" enterkeyhint="send" aria-describedby="chat-delivery chat-error" required disabled>
               <button class="primary" id="chat-send" type="submit" disabled>Send</button>
             </div>
           </form>
+          <p class="chat-status" id="chat-delivery" role="status" hidden></p>
           <p class="error chat-error" id="chat-error" role="alert" hidden></p>
         </section>
       </div>

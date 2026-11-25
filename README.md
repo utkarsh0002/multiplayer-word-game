@@ -27,6 +27,8 @@ On macOS or Linux, use `./.venv/bin/python` in place of `.\.venv\Scripts\python.
 9. To try Endless mode, create and join a new Endless room. From between-round results, either player can choose **End Match**. Cancel to stay on results, or confirm to show the final scores on both screens.
 10. For the timer path, create a room with a 15-second timer. Start, enter an answer, and let the timer expire. The scored round details should show **Time ran out** and the same submitted answers in both windows.
 
+If a saved seat cannot be resumed because the room or session no longer exists, the browser returns to room entry with an explanation. If a first Join was interrupted before the guest reached the lobby and the host sees a disconnected guest, create a new room and share the new code. The original seat can remain reserved without a token the guest can use.
+
 ### Try Community Word Approval
 
 1. Check **Community Word Approval** when creating a room, or enable it as host in the lobby. Leave it unchecked to keep strict word-list scoring.
@@ -35,7 +37,7 @@ On macOS or Linux, use `./.venv/bin/python` in place of `.\.venv\Scripts\python.
 
 ### In-room chat
 
-Use **Room chat** once both seats are claimed. Type a single-line message and press Enter or choose **Send**. The panel stays available through final results. If the other player disconnects, you can continue sending messages. Reloading a tab and resuming its seat restores the latest 50 messages, including any sent while it was away.
+Use **Room chat** once both seats are claimed. Type a single-line message and press Enter or choose **Send**. The panel stays available through final results. If the other player disconnects, you can continue sending messages. Reloading a tab and resuming its seat restores the latest 50 messages, including any sent while it was away. A matching echo or restored history clears the submitted draft if you have left it as it was. After a rejection or interruption, check the history before resending any text whose delivery is uncertain.
 
 ## Run the checks
 
@@ -43,9 +45,11 @@ Use **Room chat** once both seats are claimed. Type a single-line message and pr
 .\.venv\Scripts\python.exe -B -m unittest discover -s tests -v
 node --test tests/reconnect.test.cjs
 node --check static/app.js
+node --check tests/reconnect.test.cjs
+git diff --check
 ```
 
-The tests include local Uvicorn servers and real WebSocket connections. They cover lobby behavior, private drafts, Done and timeout, validation and scoring, Ready, multiple rounds, and match completion. Hardening tests also exercise malformed messages, unauthorized access, room expiration, simultaneous actions, and recovery from internal failures. The frontend tests use the built-in Node test runner to cover saved-seat recovery, retry limits, overlapping connection attempts, and chat history and controls.
+The tests include local Uvicorn servers and real WebSocket connections. They cover lobby behavior, private drafts, Done and timeout, validation and scoring, Ready, multiple rounds, and match completion. Hardening tests also exercise malformed messages, unauthorized access, room expiration, simultaneous actions, and recovery from internal failures. The frontend tests use the built-in Node test runner to cover saved-seat recovery, retry limits, overlapping connection attempts, chat history and delivery, pending lobby actions, countdown updates, terminal resume failures, and review focus.
 
 ## How the server runs a match
 
